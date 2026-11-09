@@ -6,7 +6,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'analytics.dart';
-import 'changelog.dart';
 import 'anilist.dart';
 import 'desktop/shell.dart';
 import 'details.dart';
@@ -22,7 +21,6 @@ import 'platform.dart';
 import 'player.dart';
 import 'search.dart';
 import 'settings.dart';
-import 'survey.dart';
 import 'sources.dart';
 import 'states.dart';
 import 'tracker.dart';
