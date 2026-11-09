@@ -1,0 +1,205 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+
+/// Linux, Windows or macOS: a mouse and keyboard, a resizable window, no phone sensors. Tests run on one of them, so
+/// they set it themselves (see test/flutter_test_config.dart).
+bool isDesktop = Platform.isLinux || Platform.isWindows || Platform.isMacOS;
+
+/// Android keeps Media3; iOS links media_kit_libs_ios_video, not a desktop binary.
+bool get supportsExternalPlayer => Platform.isAndroid;
+bool get usesMediaKit =>
+    videoBackendFor(Platform.operatingSystem) == VideoBackend.mediaKit;
+
+enum VideoBackend { exoPlayer, mediaKit }
+
+VideoBackend videoBackendFor(String os) => switch (os) {
+  'android' => VideoBackend.exoPlayer,
+  'ios' || 'macos' || 'linux' || 'windows' => VideoBackend.mediaKit,
+  _ => throw UnsupportedError('Video playback is not available on $os'),
+};
+
+/// The desktop's shortcut key: Cmd on a Mac, Ctrl on Windows and Linux.
+String get shortcutKey => Platform.isMacOS ? 'Cmd' : 'Ctrl';
+
+/// Whether the shortcut key is held, for Ctrl+click (Cmd+click on a Mac) to select several.
+bool get shortcutKeyHeld => Platform.isMacOS
+    ? HardwareKeyboard.instance.isMetaPressed
+    : HardwareKeyboard.instance.isControlPressed;
+
+/// Apple platforms keep only numbers in a version, so a beta's 2.6.0-beta.1 reads 2.6.0.1 there; this reads it back
+/// (in a beta build) so it compares with release tags.
+String appleBetaVersion(String version) =>
+    !const bool.fromEnvironment('ANIVIEW_BETA') ||
+        !(Platform.isMacOS || Platform.isIOS)
+    ? version
+    : betaFromApple(version);
+
+@visibleForTesting
+String betaFromApple(String version) => version.replaceFirstMapped(
+  RegExp(r'^(\d+\.\d+\.\d+)\.(\d+)$'),
+  (m) => '${m[1]}-beta.${m[2]}',
+);
+
+/// The Android side of the app: MainActivity.kt's 'aniview/app' and 'aniview/volume' channels. Off Android every
+/// call throws [MissingPluginException]; failures on Android arrive as [PlatformException] with the reason.
+class AndroidApp {
+  static const _app = MethodChannel('aniview/app');
+  static const _folder = MethodChannel('aniview/folder');
+  static const _volume = MethodChannel('aniview/volume');
+  static const _extensions = MethodChannel('aniview/extensions');
+
+  static Future<String?> version() async => Platform.isAndroid
+      ? _app.invokeMethod<String>('version')
+      : appleBetaVersion((await PackageInfo.fromPlatform()).version);
+
+  /// "Android 14; Pixel 7"; the OS version elsewhere.
+  static Future<String?> device() async => Platform.isAndroid
+      ? _app.invokeMethod<String>('device')
+      : Platform.operatingSystemVersion;
+
+  /// The primary ABI, to pick the matching release APK.
+  static Future<String?> abi() async =>
+      Platform.isAndroid ? _app.invokeMethod<String>('abi') : null;
+
+  /// The phone's wallpaper accent (ARGB) on Android 12+; null before Material You or off Android.
+  static Future<int?> accent() async {
+    try {
+      return await _app.invokeMethod<int>('accent');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// A call to the installed Aniyomi extensions (Extensions.kt); a failure is a [PlatformException] with the reason, or
+  /// with code 'cloudflare' and the site's address when its check needs passing by hand.
+  static Future<Object?> extensions(String method, [Map? args]) =>
+      _extensions.invokeMethod(method, args);
+
+  /// Whether Android shows navigation buttons (three-button, or the old two-button) rather than gestures.
+  static Future<bool> buttonNavigation() async {
+    try {
+      return await _app.invokeMethod<int>('navigationMode') != 2;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Running on a TV (leanback UI mode); false off Android.
+  static Future<bool> isTv() async {
+    try {
+      return await _app.invokeMethod<bool>('tv') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Opens [url] in the browser or whichever app handles it.
+  static Future<void> open(String url) async {
+    if (Platform.isIOS) return IosApp.open(url);
+    try {
+      await _app.invokeMethod('open', url);
+    } on MissingPluginException {
+      if (Platform.isWindows) rethrow; // The Windows runner uses ShellExecute, preserving OAuth query parameters.
+      final result = await Process.run(Platform.isMacOS ? 'open' : 'xdg-open', [
+        url,
+      ]);
+      if (result.exitCode != 0) {
+        throw PlatformException(
+          code: 'open',
+          message: 'Could not open the browser',
+        );
+      }
+    }
+  }
+
+  /// Windows: makes `aniview://` links (the browser's way back after signing in) open this app.
+  static Future<void> registerSignInScheme() =>
+      _app.invokeMethod('registerSignInScheme');
+
+  /// Installs the APK at [path] as an update (Android asks to confirm). False when Android first needs
+  /// "Install unknown apps" allowed: its settings page opens, and the install goes on once you're back.
+  static Future<bool> installApk(String path) async =>
+      await _app.invokeMethod<bool>('install', {'path': path}) ?? false;
+
+  /// A persisted Android document tree URI, or null when the picker was cancelled.
+  static Future<String?> pickDownloadFolder() =>
+      _folder.invokeMethod<String>('pick');
+
+  static Future<void> exportDownloadFolder(
+    String tree,
+    String id,
+    String path,
+  ) => _folder.invokeMethod('export', {'tree': tree, 'id': id, 'path': path});
+
+  static Future<Uint8List?> readDownloadFile(
+    String tree,
+    String id,
+    String file,
+  ) => _folder.invokeMethod<Uint8List>('read', {
+    'tree': tree,
+    'id': id,
+    'file': file,
+  });
+
+  /// The content:// address of [file] in a download in the picked folder.
+  static Future<String?> downloadFileUri(String tree, String id, String file) =>
+      _folder.invokeMethod<String>('uri', {
+        'tree': tree,
+        'id': id,
+        'file': file,
+      });
+
+  static Future<void> deleteDownloadFolder(String tree, String id) =>
+      _folder.invokeMethod('delete', {'tree': tree, 'id': id});
+
+  /// Plays a stream in another video app until it returns: {position, duration, completed}, empty from apps that
+  /// don't report back. Throws code "no_player" when none is installed.
+  static Future<Map<String, Object?>?> playExternal({
+    required String url,
+    required Map<String, String>? headers,
+    required String title,
+    required Duration position,
+    required List<Map<String, String>> subtitles,
+  }) => _app.invokeMapMethod<String, Object?>('external', {
+    'url': url,
+    'headers': headers,
+    'title': title,
+    'position': position.inMilliseconds,
+    'subtitles': subtitles,
+  });
+
+  /// Remuxes the downloaded episode in [dir] (its index.m3u8 and segments) into the MP4 [out].
+  static Future<void> toMp4(String dir, String out) =>
+      _app.invokeMethod('mp4', {'dir': dir, 'out': out});
+
+  /// Copies the MP4 [video] to the gallery as [name]; returns the copy's address, for [deleteFromGallery].
+  static Future<String?> saveToGallery(String video, String name) =>
+      _app.invokeMethod<String>('gallery', {'video': video, 'name': name});
+
+  static Future<void> deleteFromGallery(String uri) =>
+      _app.invokeMethod('ungallery', uri);
+
+  /// The media volume, 0–1.
+  static Future<double?> volume() => _volume.invokeMethod<double>('get');
+
+  static Future<void> setVolume(double level) =>
+      _volume.invokeMethod('set', level);
+}
+
+/// The small iOS bridge; playback itself uses media_kit's native plugin.
+class IosApp {
+  static const _channel = MethodChannel('aniview/ios');
+
+  static Future<void> open(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null ||
+        !{'https', 'http'}.contains(uri.scheme) ||
+        uri.host.isEmpty) {
+      throw ArgumentError.value(url, 'url', 'Expected a web URL');
+    }
+    return _channel.invokeMethod('open', url);
+  }
+}

@@ -1,0 +1,246 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      prepare_draft:
+        description: Attach test packages to an unpublished GitHub draft (never publishes)
+        type: boolean
+        default: false
+      native_verification_run:
+        description: Run ID containing the native-verification artifact (report.json) for this exact commit
+        type: string
+        required: false
+      beta:
+        description: Package AniView Beta, which installs beside AniView (for a pre-release)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+# A newer push to the same branch or PR supersedes a run still in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          # Pinned so a new Flutter release can't turn the build red on its own; bump it with the local fvm version.
+          flutter-version: 3.47.3
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+      - run: flutter test test/survey_test.dart --dart-define=RYBBIT_SITE_ID=ci-test --dart-define=ANIVIEW_BETA=true
+      - run: python3 tool/test_native_verification.py
+      - run: python3 tool/check_macos_bundle.py
+      - run: python3 tool/check_ios_bundle.py
+
+  # Compile for actual iPhone hardware without signing credentials; the package job publishes the IPA.
+  ios:
+    needs: check
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: 3.47.3
+          cache: true
+      - run: flutter pub get
+      - run: flutter build ios --release --no-codesign
+      - run: python3 tool/check_ios_bundle.py build/ios/iphoneos/Runner.app
+
+  # Builds each target on its own OS, since none of them cross-compiles; the tests above run on Linux only.
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: apk --debug
+          - os: windows-2022
+            target: windows --debug
+          - os: macos-15
+            target: macos --debug
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: 3.47.3
+          cache: true
+      # Xcode 26's Swift rejects flutter_inappwebview_macos; 16.4 builds it.
+      - if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - run: flutter pub get
+      - run: flutter build ${{ matrix.target }}
+
+  # Linux isn't here: flutter_inappwebview_linux needs WPE WebKit 2.50+, which Ubuntu's runners don't have, so tool/appimage.sh runs on a machine that does.
+  # Optional certification for a later publication. Test packages can be built first.
+  # Publishing still requires this job to pass for the exact release commit.
+  native-release-gate:
+    needs: check
+    if: github.event_name == 'workflow_dispatch' && inputs.native_verification_run != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Fetch native verification evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERIFICATION_RUN: ${{ inputs.native_verification_run }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          gh api "repos/$GH_REPO/actions/runs/$VERIFICATION_RUN" > verification-run.json
+          actual=$(jq -r .head_sha verification-run.json)
+          test "$actual" = "$EXPECTED_SHA" || { echo 'Verification run is for a different commit'; exit 1; }
+          jq -e '.conclusion == "success" and .path == ".github/workflows/native-verification.yml"' verification-run.json
+          gh run download "$VERIFICATION_RUN" --name native-verification --dir native-evidence
+          python3 tool/check_native_verification.py native-evidence/report.json --commit "$EXPECTED_SHA"
+
+  # Unverified test packages; building them does not authorize publication.
+  # The defines come from the DART_DEFINES secret (the contents of dart_defines.env).
+  # With the beta input, every package is AniView Beta: its own app id, name and file names (AniView-Beta-*).
+  package:
+    needs: check
+    if: github.event_name != 'pull_request'
+    env:
+      ANIVIEW_BETA: ${{ inputs.beta && '1' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: windows
+            out: build/AniView-*windows-x64-setup.exe
+          - os: macos-15
+            target: macos
+            out: AniView-*macos.dmg
+          # Unsigned; AltStore, SideStore or Sideloadly re-sign it on install (docs/ios.md).
+          - os: xcode-27
+            target: ios
+            out: build/ios/ipa/*.ipa
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: 3.47.3
+          cache: true
+      # Xcode 26's Swift rejects flutter_inappwebview_macos; 16.4 builds it.
+      - if: matrix.target == 'macos'
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - run: flutter pub get
+      - shell: bash
+        run: |
+          printf '%s\n' "$DART_DEFINES" > dart_defines.env
+          python3 - <<'PY'
+          from pathlib import Path
+          values = dict(line.split('=', 1) for line in Path('dart_defines.env').read_text().splitlines() if '=' in line and not line.lstrip().startswith('#'))
+          host = values.get('RYBBIT_HOST', 'https://rybbit.clouderp.co.tz').strip().strip('\"\'')
+          site = values.get('RYBBIT_SITE_ID', '').strip().strip('\"\'')
+          if host != 'https://rybbit.clouderp.co.tz' or not site:
+              raise SystemExit('Release requires the production Rybbit host and a configured site ID')
+          print('Rybbit release configuration verified')
+          PY
+          if [ "${{ matrix.target }}" = ios ]; then exec bash tool/ios_ipa.sh; fi
+          flutter build ${{ matrix.target }} --release --dart-define=TOP_SITES="$(dart tool/top_sites.dart)" --dart-define-from-file=dart_defines.env \
+            ${ANIVIEW_BETA:+--dart-define=ANIVIEW_BETA=true}
+        env:
+          DART_DEFINES: ${{ secrets.DART_DEFINES }}
+      - if: matrix.target == 'windows'
+        shell: bash
+        run: |
+          choco install innosetup -y --no-progress
+          version=$(sed -n 's/^version: *\([^+]*\).*/\1/p' pubspec.yaml)
+          # Git Bash would turn /DAppVersion into a path.
+          MSYS_NO_PATHCONV=1 "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "/DAppVersion=$version" ${ANIVIEW_BETA:+/DBeta} tool/aniview.iss
+      # ditto keeps the app's permissions and symlinks, which a plain copy or artifact upload would drop.
+      # The beta gets its own bundle id and name (so its own sandbox container, and a place beside AniView in
+      # Applications), then the ad-hoc signature again over the changed Info.plist.
+      - if: matrix.target == 'macos'
+        run: |
+          name=AniView file=AniView-macos.dmg
+          if [ -n "$ANIVIEW_BETA" ]; then name="AniView Beta" file=AniView-Beta-macos.dmg; fi
+          mkdir dmg
+          ditto build/macos/Build/Products/Release/aniview.app "dmg/$name.app"
+          if [ -n "$ANIVIEW_BETA" ]; then
+            plist="dmg/$name.app/Contents/Info.plist"
+            /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.kidfury.aniview.beta' "$plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleName $name" "$plist"
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $name" "$plist" 2>/dev/null ||
+              /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $name" "$plist"
+            codesign --force --deep --sign - --entitlements macos/Runner/Release.entitlements "dmg/$name.app"
+          fi
+          python3 tool/check_macos_bundle.py "dmg/$name.app"
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "$name" -srcfolder dmg -ov -format UDZO "$file"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aniview-${{ matrix.target }}
+          path: ${{ matrix.out }}
+          if-no-files-found: error
+
+  # Explicitly requested drafts only. This job never publishes or announces.
+  draft:
+    needs: [check, ios, build, package]
+    if: github.event_name == 'workflow_dispatch' && inputs.prepare_draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Attach packages to an unpublished draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          BETA: ${{ inputs.beta }}
+        run: |
+          version=$(sed -n 's/^version: *\([^+]*\).*/\1/p' pubspec.yaml)
+          if [[ "$BETA" == true && "$version" != *-beta.* ]] || [[ "$BETA" != true && "$version" == *-* ]]; then
+            echo 'Package channel does not match pubspec version'; exit 1
+          fi
+          tag="v$version"
+          gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.tag_name == \"$tag\")" > existing.json
+          if [ -s existing.json ]; then
+            jq -e --arg sha "$EXPECTED_SHA" '.draft == true and .target_commitish == $sha' existing.json
+          else
+            python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('lib/changelog.dart').read_text()
+          entries = re.findall(r"title: '([^']*)',\s+body: '([^']*)'", text)
+          if not entries:
+              raise SystemExit('No changelog entries found')
+          Path('notes.md').write_text('\n\n'.join(f'**{title}**\n{body}' for title, body in entries) + '\n')
+          PY
+            gh release create "$tag" --draft --target "$EXPECTED_SHA" --title "AniView $version" --notes-file notes.md
+          fi
+          gh run download "$RUN_ID" --pattern 'aniview-*' --dir packages
+          mapfile -d '' assets < <(find packages -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.ipa' \) -print0)
+          test "${#assets[@]}" -ge 3 || { echo 'Expected Windows, macOS and iOS packages'; exit 1; }
+          gh release upload "$tag" "${assets[@]}" --clobber
+          gh release view "$tag" --json isDraft --jq .isDraft | grep -qx true
+          echo 'Draft packages uploaded. Native verification and explicit approval are required before publication.' >> "$GITHUB_STEP_SUMMARY"

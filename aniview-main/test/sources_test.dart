@@ -1,0 +1,393 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:aniview/downloads.dart';
+import 'package:aniview/hls_proxy.dart';
+import 'package:aniview/sources.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+
+import '../tool/top_sites.dart';
+import 'fakes.dart';
+
+void main() {
+  test('AnimeStream unwraps the playlist key for numeric media IDs', () async {
+    final source = AnimeStream(
+      'AnimeStream',
+      'https://source.test',
+      net: FakeNet({
+        '/master.m3u8':
+            '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nvideo/index.m3u8\n',
+        '/video/index.m3u8': '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="../keys/key.bin?token=test"\n',
+        '/keys/key.bin': 'MUxrae99AhQJjv9+NbrK8R1c5Snz0nslaSTCmHxpQow=\n',
+        '/media/dash/ja-JP': jsonEncode({
+          'media_id': '82716332',
+          'hls': {
+            'locale': 'ja-JP',
+            'playlist': 'https://cdn.test/master.m3u8',
+            'original': true,
+          },
+        }),
+      }),
+    );
+    final stream = (await source.streams(
+      {},
+      Episode(2, ref: 'nf_82716332'),
+      dub: false,
+    )).single;
+    expect(stream.key, List.generate(16, (i) => i));
+  });
+
+  test(
+    'adds AnimeStream and moves unstable animepahe after working sources',
+    () {
+      final sites = sourcesFromRanking([
+        'animepahe|https://animepahe.pw',
+        'Anikoto|https://anikototv.to',
+        'ani.pm|https://ani.pm',
+        'Unsupported|https://unknown.test',
+      ]);
+      expect(sites.map((s) => s.name), [
+        'Anikoto',
+        'ani.pm',
+        'AnimeStream',
+        'animepahe',
+      ]);
+      expect(sites.last.label, 'animepahe · Unstable');
+      expect(sites.last.name, 'animepahe');
+      expect(sites[2].base, 'https://anime.uniquestream.net');
+    },
+  );
+
+  test('keeps a ranked AnimeStream without adding a duplicate', () {
+    final sites = sourcesFromRanking([
+      'AnimeStream|https://anime.uniquestream.net',
+      'ani.pm|https://ani.pm',
+    ]);
+    expect(sites.map((s) => s.name), ['AnimeStream', 'ani.pm']);
+    expect(sites.whereType<AnimeStream>(), hasLength(1));
+    expect(sourcesFromRanking([]).single, isA<AnimeStream>());
+  });
+
+  test('loads the top sites once, and afresh after a failed load', () async {
+    var loads = 0;
+    ExtensionHost.current = FakeHost();
+    addTearDown(() => ExtensionHost.current = const ChannelExtensionHost());
+    Sites.load = () async {
+      if (++loads == 1) throw const SocketException('offline');
+      return [AniPm('ani.pm', 'https://ani.test')];
+    };
+    await expectLater(Sites.all(), throwsA(isA<SocketException>()));
+    expect((await Sites.named('ani.pm'))?.name, 'ani.pm');
+    expect(await Sites.named('Gone'), isNull);
+    expect(identical(Sites.all(), Sites.all()), isTrue);
+    expect(loads, 2);
+  });
+
+  test('reads the top anime sites from everythingmoe markup', () {
+    const html =
+        '<div id="sec-anime" class="section"><div class="section-notes">x</div>'
+        '<div data-rank="1" data-filter="Scraper" class="section-item"><span style="color:#ffc844;">1.</span> <a href="/s/anikoto" '
+        'data-link="https://anikototv.to/home"><img src="a.png" alt=""> Anikoto</a></div>'
+        '<div data-rank="2" data-filter="Hard-sub" class="section-item"><span style="color:#d8ba76;">2.</span> <a href="/s/animepahe" '
+        'data-link="https://animepahe.pw"><img src="b.png" alt=""> animepahe</a></div>'
+        '<div data-rank="3" class="section-item">3. <a href="/s/miruro" data-link="https://miruro.tv/home">'
+        '<img src="c.png" alt=""> Miruro</a></div>'
+        '<div data-rank="4" class="section-item">4. <a href="/s/x" data-link="https://x.to"> X</a></div></div>'
+        '<div id="sec-donghua"><div data-rank="1" class="section-item">1. <a href="/s/d" data-link="https://d.to"> D</a>';
+    expect(parseTopSites(html), [
+      ('Anikoto', 'https://anikototv.to'),
+      ('animepahe', 'https://animepahe.pw'),
+      ('Miruro', 'https://miruro.tv'),
+      ('X', 'https://x.to'),
+    ]);
+  });
+
+  test('unpacks p.a.c.k.e.r scripts', () {
+    const packed =
+        r"eval(function(p,a,c,k,e,d){}('0 1=\'2://3.4/5.6\'',62,7,"
+        r"'const|source|https|cdn|example|video|m3u8'.split('|'),0,{}))";
+    expect(unpack(packed), "const source='https://cdn.example/video.m3u8'");
+  });
+
+  // Captured from megaplay.buzz getSourcesNew; the same decryption its player runs.
+  test('decrypts megaplay sources', () {
+    expect(
+      decodeMegaplaySource(
+        'wdeBruh3qqn_i5wUNnyaPcXqidp1UWP84FfPHzGyKXAz4mAVkH6j3DueswO2yXLWn8H-XMHNvbAo5Gsg7zIcFBuQI_zsUvMGI1gKwQsPTSHQHiF55R4BopgEQ-7jebQQ4C0Gu7YhaMucopp6d3Q8yAY9b5GdsSvPGq6CUn7SHyc',
+      ),
+      {
+        'file': 'https://fetch.nexabloom.top/anime/bb6d2babd7797d94d8f4a8600bc9b44e/b7d51fb7e838ee9b60dcdb34b953bc07/master.m3u8',
+      },
+    );
+  });
+
+  test('the proxy serves only the addresses it gave out', () async {
+    final dir = await Directory.systemTemp.createTemp();
+    addTearDown(() => dir.delete(recursive: true));
+    await File('${dir.path}/index.m3u8').writeAsString('#EXTM3U');
+    final given = Uri.parse(await HlsProxy.localFile(dir.path, 'index.m3u8'));
+    final guessed = given.replace(
+      pathSegments: given.pathSegments.skip(1), // the same file, no token
+    );
+    Future<int> status(Uri uri) async {
+      final client = HttpClient();
+      try {
+        final response = await (await client.getUrl(uri)).close();
+        await response.drain<void>();
+        return response.statusCode;
+      } finally {
+        client.close();
+      }
+    }
+
+    expect(await status(given), 200);
+    expect(await status(guessed), 403);
+  });
+
+  test('the player can seek within a downloaded file', () async {
+    final dir = await Directory.systemTemp.createTemp();
+    addTearDown(() => dir.delete(recursive: true));
+    await File('${dir.path}/episode.mp4')
+        .writeAsBytes(List.generate(100, (i) => i));
+    final url = await HlsProxy.localFile(dir.path, 'episode.mp4');
+    final client = HttpClient();
+    addTearDown(client.close);
+    final request = await client.getUrl(Uri.parse(url));
+    request.headers.set(HttpHeaders.rangeHeader, 'bytes=20-29');
+    final response = await request.close();
+    expect(response.statusCode, HttpStatus.partialContent);
+    expect(
+      response.headers.value(HttpHeaders.contentRangeHeader),
+      'bytes 20-29/100',
+    );
+    expect(
+      await response.expand((bytes) => bytes).toList(),
+      List.generate(10, (i) => i + 20),
+    );
+    final beyond = await client.getUrl(Uri.parse(url));
+    beyond.headers.set(HttpHeaders.rangeHeader, 'bytes=100-');
+    final invalid = await beyond.close();
+    expect(invalid.statusCode, HttpStatus.requestedRangeNotSatisfiable);
+    await invalid.drain<void>();
+  });
+
+  test('rewrites HLS playlists through the proxy', () {
+    String proxy(String url, String ext) => 'P($url).$ext';
+    final base = Uri.parse('https://cdn.test/a/master.m3u8');
+    expect(
+      rewritePlaylist(
+        '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nindex.m3u8\n',
+        base,
+        proxy,
+      ),
+      '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nP(https://cdn.test/a/index.m3u8).m3u8\n',
+    );
+    expect(
+      rewritePlaylist(
+        '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="k.key"\n#EXTINF:10,\nhttps://img.test/x.image?s=1\n',
+        base,
+        proxy,
+      ),
+      '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="P(https://cdn.test/a/k.key).ts"\n#EXTINF:10,\n'
+      'P(https://img.test/x.image?s=1).ts\n',
+    );
+  });
+
+  test('numbers a season counted on from the last one from 1', () {
+    List<num> numbers(List<num> listed, Map media) => [
+      for (final e in seasonNumbered([
+        for (final n in listed) Episode(n, ref: n),
+      ], media))
+        e.number,
+    ];
+    expect(numbers([26, 27, 28], {'episodes': 12}), [1, 2, 3]);
+    // Still airing, its count unknown: what's aired so far is the bound.
+    expect(
+      numbers(
+        [26],
+        {
+          'nextAiringEpisode': {'episode': 2},
+        },
+      ),
+      [1],
+    );
+    // Only missing its first episodes, or nothing to go by: left alone.
+    expect(numbers([5, 6], {'episodes': 12}), [5, 6]);
+    expect(numbers([26, 27], {}), [26, 27]);
+  });
+
+  test('cuts a master playlist to its best variant and default audio', () {
+    const master =
+        '#EXTM3U\n'
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="English",DEFAULT=NO,URI="en.m3u8"\n'
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Japanese",DEFAULT=YES,URI="ja.m3u8"\n'
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="s",NAME="English",URI="subs.m3u8"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,AUDIO="a"\nlow.m3u8\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=2400000,AUDIO="a"\nhigh.m3u8\n'
+        '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=90000,URI="i.m3u8"\n';
+    expect(
+      oneVariant(master),
+      '#EXTM3U\n'
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Japanese",DEFAULT=YES,URI="ja.m3u8"\n'
+      '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="s",NAME="English",URI="subs.m3u8"\n'
+      '#EXT-X-STREAM-INF:BANDWIDTH=2400000,AUDIO="a"\nhigh.m3u8\n',
+    );
+    const media = '#EXTM3U\n#EXTINF:6,\nseg.ts\n';
+    expect(oneVariant(media), media);
+  });
+
+  test('points every key at the one given', () {
+    expect(
+      rewritePlaylist(
+        '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="../keys/key.bin?s=1"\n#EXTINF:8,\nseg-0.png\n',
+        Uri.parse('https://cdn.test/a/v/playlist.m3u8'),
+        (url, ext) => 'P($url).$ext',
+        key: 'http://local/key/0',
+      ),
+      '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="http://local/key/0"\n#EXTINF:8,\n'
+      'P(https://cdn.test/a/v/seg-0.png).ts\n',
+    );
+  });
+
+  test('strips fake image headers in front of MPEG-TS segments', () {
+    final ts = Uint8List(188 * 4)
+      ..[0] = 0x47
+      ..[188] = 0x47
+      ..[376] = 0x47
+      ..[564] = 0x47;
+    expect(
+      stripToTs(Uint8List.fromList([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, ...ts])),
+      ts,
+    );
+    expect(stripToTs(Uint8List.fromList([1, 2, 3])), [1, 2, 3]);
+  });
+
+  test('strips the fake header from a segment arriving in pieces', () async {
+    final ts = Uint8List(188 * 400);
+    for (var i = 0; i < ts.length; i += 188) {
+      ts[i] = 0x47;
+    }
+    final segment = [0x89, 0x50, 0x4e, 0x47, 1, 2, 3, ...ts];
+    final pieces = [
+      for (var i = 0; i < segment.length; i += 1000)
+        segment.sublist(i, (i + 1000).clamp(0, segment.length)),
+    ];
+    final out = await stripStart(Stream.fromIterable(pieces)).toList();
+    expect(out.expand((c) => c), ts);
+    expect(
+      (await stripStart(Stream.value([1, 2, 3])).toList()).expand((c) => c),
+      [1, 2, 3],
+    );
+  });
+
+  test('picks the best variant and rewrites a media playlist to local files', () {
+    const master =
+        '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlow/index.m3u8\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=2400000\nhigh/index.m3u8\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=90000,URI="i.m3u8"\n';
+    expect(bestVariant(master), 'high/index.m3u8');
+
+    const sized =
+        '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080\n1080.m3u8\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720\n720.m3u8\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=854x480\n480.m3u8\n';
+    expect(bestVariant(sized), '1080.m3u8');
+    expect(bestVariant(sized, maxHeight: 720), '720.m3u8');
+    // Nothing fits: the smallest.
+    expect(bestVariant(sized, maxHeight: 360), '480.m3u8');
+
+    final (local, files, length) = localizePlaylist(
+      '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="/k/1.key"\n#EXTINF:4.5,\nseg1.ts\n'
+      '#EXTINF:5.5,\nhttps://img.test/x.image?sig=1\n#EXT-X-ENDLIST\n',
+      Uri.parse('https://cdn.test/a/index.m3u8'),
+    );
+    expect(
+      local,
+      '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key0.bin"\n#EXTINF:4.5,\nseg00000.ts\n'
+      '#EXTINF:5.5,\nseg00001.ts\n#EXT-X-ENDLIST\n',
+    );
+    expect(files, {
+      'key0.bin': Uri.parse('https://cdn.test/k/1.key'),
+      'seg00000.ts': Uri.parse('https://cdn.test/a/seg1.ts'),
+      'seg00001.ts': Uri.parse('https://img.test/x.image?sig=1'),
+    });
+    expect(length, const Duration(seconds: 10));
+  });
+
+  // The offline season cache stores episodes as JSON; nested refs (Anikoto's data attributes) must survive the round trip.
+  test('episodes round-trip through JSON', () {
+    const episode = Episode(
+      5.5,
+      title: 'T',
+      overview: 'O',
+      ref: {
+        'sub': {'p': 'id'},
+      },
+    );
+    final back = Episode.fromJson(jsonDecode(jsonEncode([episode]))[0]);
+    expect(
+      [back.number, back.title, back.thumbnail, back.overview, back.ref],
+      [5.5, 'T', null, 'O', episode.ref],
+    );
+  });
+
+  group('site adapters read their pages', () {
+    /// Answers each request with the snapshot whose key its URL contains.
+    void serve(Map<String, String> pages) =>
+        httpClient = MockClient((request) async {
+          final url = '${request.url}';
+          for (final MapEntry(:key, :value) in pages.entries) {
+            if (url.contains(key)) return http.Response(value, 200);
+          }
+          return http.Response('', 404);
+        });
+
+    test('Anikoto: search results, and a match only on the right MAL id', () async {
+      String item(String href, String title, String mal) =>
+          '<div class="item "><img src="https://img.test/$mal.jpg">'
+          '<a class="name d-title" href="$href" data-jp="x">$title</a>'
+          '<div class="right">TV</div></div>';
+      String list(String mal) => jsonEncode({
+        'result':
+            '<ul><a href="#" data-num="1" data-ids="ids-$mal-1" data-mal="$mal">1</a>'
+            '<a href="#" data-num="2" data-ids="ids-$mal-2" data-mal="$mal">2</a></ul>',
+      });
+      serve({
+        '/filter?keyword=':
+            item('https://ak.test/watch/other', 'Other &amp; Co', '1') +
+            item('https://ak.test/watch/right', 'Right', '5114'),
+        '/watch/other': '<div id="watch-main" class="w" data-id="10">',
+        '/watch/right': '<div id="watch-main" class="w" data-id="20">',
+        '/episode/list/10': list('1'),
+        '/episode/list/20': list('5114'),
+      });
+      final site = Anikoto('Anikoto', 'https://ak.test');
+
+      final results = await site.search('x');
+      expect(
+        [for (final r in results) (r.id, r.title, r.info)],
+        [
+          ('https://ak.test/watch/other', 'Other & Co', 'TV'),
+          ('https://ak.test/watch/right', 'Right', 'TV'),
+        ],
+      );
+      final media = {
+        'id': 1,
+        'idMal': 5114,
+        'title': {'romaji': 'Right'},
+      };
+      expect(await site.match(media), 'https://ak.test/watch/right');
+      final episodes = await site.episodesOf('https://ak.test/watch/right');
+      expect([for (final e in episodes) e.number], [1, 2]);
+      expect((episodes.first.ref as Map)['ids'], 'ids-5114-1');
+    });
+
+    test('a redesigned page gives no episodes rather than failing', () async {
+      serve({'/watch/x': '<html>redesigned</html>'});
+      final site = Anikoto('Anikoto', 'https://ak.test');
+      expect(await site.episodesOf('https://ak.test/watch/x'), isEmpty);
+    });
+  });
+}

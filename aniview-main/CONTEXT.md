@@ -1,0 +1,73 @@
+# AniView domain
+
+**Show** (`lib/anilist.dart`, `Show`): a show as AniList describes it (MyAnimeList's answers are mapped to the
+same shape), read through its facts: title, cover, backdrop, score, its full **episodes** count (what list tracking
+completes at) versus **aired** (episodes out so far), and the user's list entry. A typed view over the raw map.
+
+**Watch progress** (`lib/history.dart`, `WatchHistory`): where the user stopped in each show, kept on-device and
+mirrored to the TV launcher's Continue watching row. It owns when an episode counts as watched (`finished`, from
+the Settings percentage) and what a play does to history (`played`: keep the spot, move on to the next episode, or
+drop a finished show). Each entry is a **watch record** (`WatchRecord`: show, episode, position, site, audio);
+the **resume point** is a record's position for the episode it names. Distinct from **tracked progress**, the episode count on AniList (`mediaListEntry.progress`).
+
+**Episode plan** (`EpisodePlan`): a show's episode list as the details page shows it: pages, the page it opens on,
+the **up next** episode (lowest-numbered one not yet watched), and each episode's watched state and resume point.
+It also decides a show's **main action** (`nextUp`): resume the saved spot, else play the up next episode.
+
+**Show episodes** (`lib/episode_actions.dart`, `ShowEpisodes`): a show's episodes as its page has them open from one
+site (or offline): which of them **play** (offline, only downloaded ones), where playing one starts and the site it's
+remembered under (its own download's, offline), and the **episode actions** each offers (play, mark watched, download
+or retry from the site open now, delete, discussion, select). Every layout of the details page asks here and only picks
+which actions it shows.
+
+**Playback session** (`lib/playback.dart`, `PlaybackSession`): the player's decisions about the episode playing,
+apart from painting it: **opening** it (its download, else the site's servers, from the resume point), server
+fallback when a server never loads, which subtitles to show, when it counts as watched, when to save the spot, which skip applies,
+when to offer or start the next episode (**up next**), what OK on a TV remote does, and where a held seek lands.
+
+**Video player** (`lib/exo.dart`, `ExoPlayer`): plays a stream and **settles** it once loaded (`load`): lands on the
+resume point when the stream ignored it, shows the picked subtitles, keeps the audio track picked before. Its
+**backend** (`PlayerBackend`) is Media3 ExoPlayer on Android, native media_kit/libmpv on iOS and desktop, or a fake
+in tests. iOS links `media_kit_libs_ios_video` XCFrameworks and uses the native iOS texture renderer. Its downloads
+stay in sandboxed storage as HLS or direct video files, with relative names resolved against the current container.
+
+**Sites** (`lib/sources.dart`): the supported streaming sites from everythingmoe's ranking, in rank order, with AnimeStream included as a fallback and unstable animepahe moved last, followed by the
+sites of any installed Aniyomi **extensions** (`lib/extensions.dart`, run by `Extensions.kt`). A **source** is one site's
+adapter (Anikoto, animepahe, ani.pm, AnimeStream, an extension's `ExtensionSource`, or the user's own
+Jellyfin server, `lib/jellyfin.dart`, listed first once connected in Settings); history and downloads remember it by name.
+Adapters reach the network through a `Net` (`lib/net.dart`: plain HTTP, or `CloudflareNet` with a passed check's clearance)
+and extensions through an `ExtensionHost` (`lib/sources.dart`: the Android side, typed); both are faked in tests.
+
+**Listing** (`lib/site_listing.dart`, `SiteListing`): a show's entry on one site: its **episodes** (the person's pick of
+which entry the show is, else the site's own guess, with titles and artwork from ani.zip) and the **streams** of an
+episode. It also decides who gets a site's Cloudflare check passed: the verification page on a screen (the details page,
+the player), nobody in a download, which fails with the check instead. Distinct from the **Episode plan**, which arranges
+the episodes a listing returns.
+
+**Tracker** (`lib/tracker.dart`): browsing (AniList, with MyAnimeList as a read-only fallback), the AniList
+session, and **tracked progress** saves, queued on-device when AniList can't take them. Each **catalog**
+(`Catalog`) answers browsing; AniList's and MyAnimeList's are its two adapters.
+
+**Search session** (`lib/search.dart`, `SearchSession`): a search as it's typed: waits for typing to pause, skips a
+single letter, browses by filters alone, drops answers to replaced searches, and pages on.
+
+**Offline playback**: a download plays instead of streaming only in the chosen audio while the site can be reached,
+and in either audio when it can't (`Downloads.toPlay`).
+
+**TV link** (`lib/pairing.dart`, `TvLink`): the TV's always-on Wi-Fi endpoint while the app runs on a TV. Phones
+find it by broadcast, **pair** with it only while a pairing screen is open on the TV (both show a code the user
+compares). Pairing makes the phone a **phone remote**, whose key presses are sealed with the pairing key and
+refused when replayed, and signs the TV in to the phone's AniList account when the TV has none. Each answer tells
+the phone what's **now playing**, for its playback controls; its typing searches on the TV (never mid-episode).
+
+**Selection** (`lib/selection.dart`, `Selection`): things picked on a page (shows, episodes) by key for one change to all of
+them: toggle, All, clear, held while a bulk change runs (`runBulk`, one request at a time, reporting a `BulkResult`).
+`Picking` (`lib/ui.dart`) is a selection of shows; posters under a `PickingScope` join it.
+
+**Home feed** (`lib/home_feed.dart`, `HomeFeed`): the futures behind Home, Schedule, My list and Me, built when first read and
+replaced when stale (AniList asked again at most once a minute; watch history always re-read), over a `HomeSource`. Also the
+pure rules on what they hold: a schedule day, the home list rows, and what a remote **intent** does (`decide`).
+
+**Filler** (`lib/filler.dart`, `Filler`): which episodes are filler or mixed, from Anime Filler List, matched by the show's
+English or romaji title (its own name before another show's bracketed one). Marked on the episode list; with
+**Skip filler** on, the up next episode, the main action and the player's next episode pass over filler.

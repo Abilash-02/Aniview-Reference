@@ -1,0 +1,2605 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:screen_brightness/screen_brightness.dart';
+import 'package:window_manager/window_manager.dart';
+
+import 'analytics.dart';
+import 'anilist.dart';
+import 'cloudflare.dart';
+import 'downloads.dart';
+import 'exo.dart';
+import 'history.dart';
+import 'hls_proxy.dart';
+import 'filler.dart';
+import 'jellyfin.dart';
+import 'metadata.dart';
+import 'settings.dart';
+import 'site_listing.dart';
+import 'sources.dart';
+import 'states.dart';
+import 'stream_address.dart';
+import 'tracker.dart';
+import 'tv.dart';
+import 'ui.dart';
+import 'desktop.dart' show setPlayerTitle;
+import 'platform.dart';
+import 'playback.dart';
+
+part 'desktop/player_view.dart';
+
+/// Full-screen player with Dantotsu-style gestures: double-tap seek, optional swipe seek and brightness (left) /
+/// volume (right) swipes, hold for 2× or to pause, lock, episode drawer, server/subtitle/speed pickers, AniSkip with
+/// intro/outro markers on the seek bar. Downloaded episodes always play from disk.
+class PlayerScreen extends StatefulWidget {
+  const PlayerScreen({
+    super.key,
+    required this.media,
+    required this.source,
+    required this.episodes,
+    required this.index,
+    required this.dub,
+    this.sourceName,
+    this.backend,
+  });
+
+  final PlayerBackend? backend;
+  final Map media;
+  final Source?
+  source; // null when playing downloads while the site is unreachable
+  final String? sourceName;
+  final List<Episode> episodes;
+  final int index;
+  final bool dub;
+
+  /// Whether a player is open, when the remote's search key does nothing.
+  static bool showing = false;
+
+  @override
+  State<PlayerScreen> createState() => _PlayerScreenState();
+}
+
+class _PlayerScreenState extends State<PlayerScreen> {
+  // ExoPlayer, as CloudStream plays: hardware decoding with fallback to another decoder, and a deep buffer.
+  late final player = ExoPlayer(widget.backend);
+  final _scaffold = GlobalKey<ScaffoldState>();
+  // The site playing: the one the page chose, until "Try another site" moves it.
+  late Source? _source = widget.source;
+  late String? _siteName = widget.sourceName;
+  late List<Episode> _episodes = widget.episodes;
+  late PlaybackSession session = _newSession(widget.index);
+
+  /// Filler episodes, which "next" passes over when Settings say to skip them.
+  Set<num> _filler = const {};
+
+  PlaybackSession _newSession(int index) => PlaybackSession(
+    _episodes,
+    index,
+    media: widget.media,
+    dub: widget.dub,
+    site: _sourceName,
+    downloaded: (episode) {
+      final download = Downloads.instance.toPlay(
+        widget.media,
+        episode.number,
+        dub: widget.dub,
+        online: _source != null,
+      );
+      return download == null ? null : Downloads.instance.streamFor(download);
+    },
+    downloadedDub: (episode) =>
+        Downloads.instance
+            .toPlay(
+              widget.media,
+              episode.number,
+              dub: widget.dub,
+              online: _source != null,
+            )
+            ?.dub ??
+        widget.dub,
+    allowSubFallback: Settings.fallbackToSub,
+    fetch: _source != null || _siteName != null
+        ? (e) => _fetchEpisode(e, dub: widget.dub)
+        : null,
+    fetchSub: _source != null || _siteName != null
+        ? (e) => _fetchEpisode(e, dub: false)
+        : null,
+  )..skipped = _filler;
+
+  Future<List<VideoStream>> _fetchEpisode(
+    Episode episode, {
+    required bool dub,
+  }) async {
+    final source = _source ?? await Sites.named(_sourceName);
+    if (source == null) {
+      throw StateError('$_sourceName is unavailable. Try another site.');
+    }
+    if (!mounted) return [];
+    final listing = SiteListing(
+      source,
+      widget.media,
+      onChallenge: uiChallenge(context),
+    );
+    var target = episode;
+    if (_source == null) {
+      final listed = await listing.episodes();
+      target =
+          listed.where((item) => item.number == episode.number).firstOrNull ??
+          (throw StateError(
+            'Episode ${episode.number} is unavailable on ${source.name}',
+          ));
+    }
+    return listing.streams(target, dub: dub);
+  }
+
+  int? _skipsRequested;
+  String subtitle = 'Auto';
+
+  /// The audio track picked, by name; null for the stream's own pick. The next episode or server keeps it when it
+  /// has one named alike.
+  String? audio;
+  Object? error;
+  String? hint;
+  IconData? hintIcon;
+  bool controls = true, locked = false;
+
+  /// Whether the video was playing when a hold paused it, to play it again on release.
+  bool heldPlaying = false;
+
+  /// Held for 2×: shows [_FastForward] until let go.
+  bool fastHeld = false;
+
+  /// Fit, fill (crop) or stretch.
+  BoxFit fit = Settings.videoFit;
+
+  /// The height picked in the player for this session; 0 for Auto.
+  int quality = 0;
+  List<int> _desktopHeights = const [];
+  bool _changingQuality = false;
+  int _playGeneration = 0;
+  double rate = Settings.speed, brightness = .5, volume = 1, doubleTapX = 0;
+  // Desktop: the volume before M muted it, the pointer's place over the seek bar (0–1), and always on top.
+  double _beforeMute = 1;
+  final _seekHover = ValueNotifier<double?>(null);
+  bool _onTop = false, _overControls = false;
+
+  /// For the desktop controls, which live in their own file and can't call [setState].
+  void _set(VoidCallback change) => setState(change);
+  // The phone's media volume as 0–1.
+
+  Duration? seekTarget;
+  Duration? _startAt; // where the current server was asked to start
+  Timer? _hideTimer, _hintTimer;
+  late final List<StreamSubscription> _subs;
+  final _playFocus = FocusNode();
+  // Out of traversal: it spans the screen, so the D-pad would otherwise land on it between buttons.
+  final _keys = FocusNode(debugLabel: 'player keys', skipTraversal: true);
+  final _controlsNode = FocusNode(skipTraversal: true, canRequestFocus: false);
+
+  /// The seek bar alone, shown for a moment while seeking with the controls hidden.
+  bool _timelineShown = false;
+  Timer? _timelineTimer;
+
+  void _showTimeline() {
+    _timelineTimer?.cancel();
+    setState(() => _timelineShown = true);
+    _timelineTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _timelineShown = false);
+    });
+  }
+
+  /// Into the controls: play/pause, or while a video loads (no play button yet) the first control there is.
+  void _focusControls() {
+    if (_playFocus.context != null) return _playFocus.requestFocus();
+    _controlsNode.traversalDescendants.firstOrNull?.requestFocus();
+  }
+
+  int _shownSecond = -1;
+  // Home on a TV or switching apps may be the last chance: the app can be closed from there.
+  late final _lifecycle = AppLifecycleListener(
+    onHide: () {
+      _saveHistory();
+      // iOS may suspend the app immediately. Keep playback foreground-only and resume explicitly.
+      if (Platform.isIOS) player.pause().ignore();
+    },
+  );
+
+  int get index => session.index;
+  List<VideoStream> get streams => session.streams;
+  VideoStream? get current => session.current;
+  List<SkipTime> get skips => session.skips;
+  Episode get episode => session.episode;
+  bool get hasNext => session.hasNext;
+  String get _sourceName => _siteName ?? _source?.name ?? 'Downloads';
+
+  @override
+  void initState() {
+    super.initState();
+    if (Settings.skipFiller) {
+      Filler.of(widget.media).then((kinds) {
+        _filler = {
+          for (final e in kinds.entries)
+            if (e.value == EpisodeKind.filler) e.key,
+        };
+        if (mounted) setState(() => session.skipped = _filler);
+      });
+    }
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    PlayerScreen.showing = true;
+    onRemoteSeek = (to) =>
+        player.seek(PlaybackSession.clamp(to, player.state.duration));
+    _lifecycle;
+    player.setQuality(Settings.streamQuality).ignore();
+    ScreenBrightness().application.then((v) => brightness = v).ignore();
+    Analytics.screen('/player', title: 'Player');
+    _subs = [
+      player.stream.position.listen(_onPosition),
+      player.stream.duration.listen(_onDuration),
+      player.stream.playing.listen((_) {
+        _refresh();
+        _publish();
+      }),
+      player.stream.buffering.listen((_) => _refresh()),
+      player.stream.tracks.listen((_) => _refresh()),
+      // A stream that never loads would otherwise spin on "Loading video…" forever.
+      player.stream.error.listen((e) {
+        if (!mounted || !session.stalled(player.state.duration)) return;
+        // Aggregated sources often list dead servers; move on before giving up.
+        if (session.fallback() case final next?) {
+          _hint(
+            '${current!.label} failed · trying ${next.label}',
+            icon: Icons.dns_rounded,
+          );
+          _play(next, at: _startAt);
+        } else {
+          setState(() => error = Exception(e));
+        }
+      }),
+      player.stream.completed.listen((done) {
+        if (done && session.advancesOnFinish) {
+          _load(session.nextIndex);
+        }
+      }),
+    ];
+    _load(index);
+    _scheduleHide();
+  }
+
+  /// TV remote: with the controls hidden, left/right seek, OK plays/pauses and up/down bring the controls
+  /// up; with them showing, the D-pad moves between buttons. Media keys work either way.
+  bool _onKey(KeyEvent event) {
+    if (isDesktop && !isTv) return _onDesktopKey(event);
+    if (!isTv || !mounted) return false;
+    // Releasing a held left/right lands the scrub with one seek.
+    if (event is KeyUpEvent) {
+      if (session.release() case final to?) {
+        player.seek(to);
+        seekTarget = null;
+        _showTimeline();
+      }
+      return false;
+    }
+    // Leave keys alone while a menu, dialog or the episode list is open, or for the error's buttons.
+    if (error != null ||
+        ModalRoute.of(context)?.isCurrent != true ||
+        _scaffold.currentState?.isEndDrawerOpen == true) {
+      return false;
+    }
+    final key = event.logicalKey;
+    final seek = Settings.seekSeconds;
+    if (key == LogicalKeyboardKey.mediaPlayPause ||
+        key == LogicalKeyboardKey.mediaPlay ||
+        key == LogicalKeyboardKey.mediaPause) {
+      player.playOrPause();
+    } else if (key == LogicalKeyboardKey.mediaFastForward) {
+      _seekBy(seek);
+    } else if (key == LogicalKeyboardKey.mediaRewind) {
+      _seekBy(-seek);
+    } else if (key == LogicalKeyboardKey.mediaTrackNext && hasNext) {
+      _load(session.nextIndex);
+    } else if (controls && !locked) {
+      _scheduleHide(); // browsing the controls keeps them up
+      // Nothing inside has focus yet (just opened): start on play/pause.
+      if (!_keys.hasPrimaryFocus) return false;
+      _focusControls();
+    } else if (key == LogicalKeyboardKey.arrowLeft ||
+        key == LogicalKeyboardKey.arrowRight) {
+      _scrub(event);
+    } else if (event is KeyDownEvent &&
+        (key == LogicalKeyboardKey.select ||
+            key == LogicalKeyboardKey.enter ||
+            key == LogicalKeyboardKey.arrowUp ||
+            key == LogicalKeyboardKey.arrowDown)) {
+      if (key == LogicalKeyboardKey.select || key == LogicalKeyboardKey.enter) {
+        switch (error == null
+            ? session.ok(player.state.position, player.state.duration)
+            : PlayPause()) {
+          case PlayNext():
+            _load(session.nextIndex);
+            return true;
+          case SkipTo(:final position):
+            player.seek(position);
+            return true;
+          case PlayPause():
+            player.playOrPause();
+        }
+      }
+      setState(() {
+        controls = true;
+        locked = false;
+      });
+      _scheduleHide();
+      WidgetsBinding.instance.addPostFrameCallback((_) => _focusControls());
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  void _setVolume(double v) {
+    volume = v.clamp(0.0, 1.0);
+    player.setVolume(volume).ignore();
+    _hint(
+      '${(volume * 100).round()}%',
+      icon: volume == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+    );
+  }
+
+  void _nudgeVolume(double delta) => _setVolume(volume + delta);
+
+  /// How far the desktop's bottom controls reach up the video: the floating skip and up next sit above them.
+  static const _deskBarHeight = 150.0;
+
+  static const _speeds = [.5, .75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+  void _stepSpeed(int direction) {
+    final i = _speeds.indexOf(rate);
+    final next =
+        _speeds[(i < 0 ? _speeds.indexOf(1.0) : i + direction).clamp(
+          0,
+          _speeds.length - 1,
+        )];
+    setState(() => rate = next);
+    player.setRate(next);
+    _hint('$next×', icon: Icons.speed_rounded);
+  }
+
+  void _toggleFullscreen() => windowManager.isFullScreen().then(
+    (full) => windowManager.setFullScreen(!full),
+  );
+
+  /// The play button: plays or pauses and keeps the controls up. A click on the video only shows or hides them.
+  void _click() {
+    player.playOrPause();
+    _showControls();
+  }
+
+  void _showControls() {
+    if (!controls) setState(() => controls = true);
+    _scheduleHide();
+  }
+
+  /// The pointer over the video: moving it brings the controls up and the wheel changes the volume. Still, the
+  /// controls and the cursor go away while it plays.
+  Widget _pointer(Widget child) => !isDesktop
+      ? child
+      : Listener(
+          onPointerSignal: (e) {
+            if (e is PointerScrollEvent) {
+              _nudgeVolume(e.scrollDelta.dy < 0 ? .05 : -.05);
+            }
+          },
+          child: MouseRegion(
+            cursor: controls || !player.state.playing
+                ? MouseCursor.defer
+                : SystemMouseCursors.none,
+            onHover: (_) => _showControls(),
+            child: child,
+          ),
+        );
+
+  /// Desktop keyboard: space or K plays/pauses, left/right seek, up/down and the wheel change the volume, M mutes, [ and ]
+  /// change the speed, N plays the next episode, T keeps the window on top, F or F11 toggles fullscreen and Esc leaves it.
+  bool _onDesktopKey(KeyEvent event) {
+    if (event is KeyUpEvent || !mounted) return false;
+    // Ctrl, Cmd and Alt combinations are the app's shortcuts (Alt+Left goes back, Cmd+[ too), not M or [ for the player.
+    final keys = HardwareKeyboard.instance;
+    if (keys.isMetaPressed || keys.isControlPressed || keys.isAltPressed) {
+      return false;
+    }
+    if (error != null ||
+        ModalRoute.of(context)?.isCurrent != true ||
+        _scaffold.currentState?.isEndDrawerOpen == true) {
+      return false;
+    }
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.space || key == LogicalKeyboardKey.keyK) {
+      if (event is KeyDownEvent) player.playOrPause();
+    } else if (key == LogicalKeyboardKey.arrowLeft) {
+      _seekBy(-Settings.seekSeconds);
+    } else if (key == LogicalKeyboardKey.arrowRight) {
+      _seekBy(Settings.seekSeconds);
+    } else if (key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.arrowDown) {
+      _nudgeVolume(key == LogicalKeyboardKey.arrowUp ? .05 : -.05);
+    } else if (key == LogicalKeyboardKey.keyM) {
+      if (event is KeyDownEvent) {
+        if (volume > 0) _beforeMute = volume;
+        _setVolume(volume > 0 ? 0 : _beforeMute);
+      }
+    } else if (key == LogicalKeyboardKey.bracketLeft ||
+        key == LogicalKeyboardKey.bracketRight) {
+      if (event is KeyDownEvent) {
+        _stepSpeed(key == LogicalKeyboardKey.bracketRight ? 1 : -1);
+      }
+    } else if (key == LogicalKeyboardKey.keyT) {
+      if (event is KeyDownEvent) {
+        _onTop = !_onTop;
+        windowManager.setAlwaysOnTop(_onTop).ignore();
+        _hint(
+          _onTop ? 'Always on top' : 'Not on top',
+          icon: Icons.picture_in_picture_alt_rounded,
+        );
+      }
+    } else if (key == LogicalKeyboardKey.keyN && hasNext) {
+      if (event is KeyDownEvent) _load(session.nextIndex);
+    } else if (key == LogicalKeyboardKey.keyF ||
+        key == LogicalKeyboardKey.f11) {
+      if (event is KeyDownEvent) _toggleFullscreen();
+    } else if (key == LogicalKeyboardKey.escape) {
+      if (event is! KeyDownEvent) return false;
+      // Esc leaves fullscreen first; out of it, Esc is just Back.
+      windowManager.isFullScreen().then((full) {
+        if (full) {
+          windowManager.setFullScreen(false);
+        } else if (mounted) {
+          Navigator.maybePop(context);
+        }
+      });
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  /// Left/right: a step per press, or a scrub while held that lands on release (see [_onKey]).
+  void _scrub(KeyEvent event) {
+    final seek = Settings.seekSeconds;
+    final step = event.logicalKey == LogicalKeyboardKey.arrowLeft
+        ? -seek
+        : seek;
+    final held = event is KeyRepeatEvent
+        ? session.hold(player.state.duration, step)
+        : null;
+    if (held != null) {
+      seekTarget = held;
+      _showTimeline();
+      _hint(formatDuration(held), icon: step > 0 ? _forwardIcon : _replayIcon);
+    } else {
+      _seekBy(step);
+    }
+  }
+
+  @override
+  void dispose() {
+    _playFocus.dispose();
+    _tvLabel.dispose();
+    _keys.dispose();
+    _controlsNode.dispose();
+    _lifecycle.dispose();
+    PlayerScreen.showing = false;
+    nowPlaying.value = null;
+    onRemoteSeek = null;
+    _saveHistory();
+    for (final sub in _subs) {
+      sub.cancel();
+    }
+    _hideTimer?.cancel();
+    _hintTimer?.cancel();
+    _timelineTimer?.cancel();
+    _seekHover.dispose();
+    player.dispose();
+    if (Platform.isAndroid || Platform.isIOS) {
+      ScreenBrightness().resetApplicationScreenBrightness();
+    }
+    if (isDesktop) {
+      setPlayerTitle(null);
+      windowManager.setFullScreen(false).ignore();
+      if (_onTop) windowManager.setAlwaysOnTop(false).ignore();
+    }
+    restoreOrientation();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    super.dispose();
+  }
+
+  void _refresh() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _load(int i, {Duration? at}) async {
+    _saveHistory(); // where the outgoing episode stopped, before index moves on
+    setState(() {
+      session.start(i);
+      error = null;
+      _skipsRequested = null;
+    });
+    if (isDesktop) {
+      setPlayerTitle(
+        '${titleOf(widget.media)} · Episode ${epNumber(session.episode.number)}',
+      );
+    }
+    // The previous episode keeps emitting its (near-end) position while servers load, which would count the new one as watched.
+    await player.stop();
+    if (!mounted) return;
+    try {
+      final opened = await session.open(i, at: at);
+      if (!mounted || opened == null) return;
+      if (session.fellBackToSub) {
+        _hint('Dub unavailable · playing Sub', icon: Icons.audiotrack_outlined);
+      }
+      Analytics.event('episode_play', {
+        'media_id': widget.media['id'],
+        'episode': episode.number,
+        'source': _sourceName,
+        'dub': session.playingDub,
+        'downloaded': session.fromDownload,
+      });
+      if (supportsExternalPlayer && Settings.externalPlayer) {
+        final stopped = await _playExternal(streams.first, at: opened.at);
+        if (!mounted) return;
+        if (stopped == null) {
+          throw Exception('No video player app is installed');
+        }
+        return Navigator.pop(context);
+      }
+      await _play(streams.first, at: opened.at);
+    } catch (e) {
+      if (mounted && index == i) setState(() => error = e);
+    }
+  }
+
+  /// When the site has nothing for this episode: pick another site, find the show and the same episode there, and
+  /// play it from there.
+  Future<void> _switchSite() async {
+    final here = _sourceName;
+    final sites = [
+      for (final s in await Sites.all())
+        if (s.name != here) s,
+    ];
+    if (!mounted) return;
+    final picked = await pickOne<Source?>(context, 'Try another site', {
+      for (final s in sites) s: s.name,
+    }, null);
+    if (picked == null || !mounted) return;
+    final number = episode.number;
+    setState(() => error = null);
+    try {
+      final episodes = await SiteListing(
+        picked,
+        widget.media,
+        onChallenge: uiChallenge(context),
+      ).episodes();
+      final at = episodes.indexWhere((e) => e.number == number);
+      if (at < 0) throw Exception('${picked.name} has no Episode $number');
+      if (!mounted) return;
+      _source = picked;
+      _siteName = picked.name;
+      _episodes = episodes;
+      session = _newSession(at);
+      await _load(at);
+    } catch (e) {
+      if (mounted) setState(() => error = e);
+    }
+  }
+
+  Future<void> _play(VideoStream stream, {Duration? at}) async {
+    final generation = ++_playGeneration;
+    _startAt = at;
+    setState(() => session.playing(stream));
+    final address = await StreamAddress.instance.forPlayer(stream);
+    if (!mounted || generation != _playGeneration || current != stream) return;
+    if (usesMediaKit) {
+      final heights = await HlsProxy.configureQuality(
+        address.url,
+        quality == 0 ? Settings.streamQuality : quality,
+      );
+      if (!mounted || generation != _playGeneration || current != stream) {
+        return;
+      }
+      if (quality != 0 && !heights.contains(quality)) {
+        quality = 0;
+        await HlsProxy.configureQuality(address.url, Settings.streamQuality);
+        if (!mounted || generation != _playGeneration || current != stream) {
+          return;
+        }
+      }
+      setState(() => _desktopHeights = heights);
+    }
+    final pick = session.subtitleFor(stream);
+    final shown = await player.load(
+      address.url,
+      headers: address.headers,
+      hls: address.hls,
+      start: at,
+      subtitles: address.subtitles,
+      audios: address.audios,
+      subtitlesOff: pick.off,
+      subtitleFile: pick.track?.label,
+      audio:
+          audio, // the one picked before, when this stream has one named alike
+      rate: rate,
+    );
+    if (shown == null ||
+        !mounted ||
+        generation != _playGeneration ||
+        current != stream) {
+      return;
+    }
+    // No subtitle file: the stream's own tracks, picked by the subtitle language rather than whatever the file marks.
+    final own = shown == 'Auto'
+        ? PlaybackSession.embeddedSubtitle(
+            player.state.subtitles,
+            Settings.subtitleLanguage,
+          )
+        : null;
+    if (own != null) return _setSubtitle(own, own.name);
+    setState(() => subtitle = shown);
+  }
+
+  /// Hands [stream] to another video app and records where it stopped like our own player would. Returns that
+  /// position (zero when the app doesn't report it), or null when no app can play it.
+  Future<Duration?> _playExternal(VideoStream stream, {Duration? at}) async {
+    if (!supportsExternalPlayer) return null;
+    setState(() => session.current = stream);
+    try {
+      final address = await StreamAddress.instance.forExternalApp(stream);
+      final result = await AndroidApp.playExternal(
+        url: address.url,
+        headers: address.headers, // MX Player only
+        title: '${titleOf(widget.media)} · Episode ${epNumber(episode.number)}',
+        position: at ?? Duration.zero,
+        subtitles: [
+          for (final s in address.subtitles) {'label': s.label, 'url': s.url},
+        ],
+      );
+      final (:position, :duration) = PlaybackSession.externalStop(result);
+      _checkWatched(position, duration);
+      _saveHistory(position, duration);
+      return position;
+    } catch (e) {
+      _hint(
+        e is PlatformException
+            ? e.message ?? 'No video player app'
+            : 'Could not open video app',
+        icon: Icons.error_outline,
+      );
+      return null;
+    }
+  }
+
+  bool get _hasAudios => player.state.audios.length > 1;
+
+  /// Subtitles: off, the stream's own files, then the player's tracks.
+  _Choice<Object> get _subtitleChoice {
+    final options = PlaybackSession.subtitleOptions(
+      current?.subtitles ?? const [],
+      player.state.subtitles,
+    );
+    return _Choice(
+      'Subtitles',
+      options,
+      options.entries.where((e) => e.value == subtitle).firstOrNull?.key ??
+          'off',
+      (picked) async {
+        switch (picked) {
+          case Subtitle s:
+            if (await player.showSubtitleFile(s.label) && mounted) {
+              setState(() => subtitle = s.label);
+            }
+          case SubtitleTrack t:
+            await _setSubtitle(t, t.name);
+          case 'off':
+            await _setSubtitle(SubtitleTrack.off, 'Off');
+        }
+      },
+    );
+  }
+
+  _Choice<SubtitleTrack> get _audioChoice {
+    final tracks = player.state.audios;
+    return _Choice(
+      'Audio',
+      {for (final t in tracks) t: t.name},
+      tracks.where((t) => t.name == audio).firstOrNull ?? tracks.first,
+      (t) async {
+        await player.setAudioTrack(t);
+        if (mounted) setState(() => audio = t.name);
+      },
+    );
+  }
+
+  /// The servers, switchable in place (keeps the position).
+  _Choice<VideoStream> get _serverChoice => _Choice(
+    'Server',
+    {for (final s in streams) s: s.label},
+    current!,
+    (s) async {
+      if (s != current && mounted) await _play(s, at: player.state.position);
+    },
+  );
+
+  _Choice<int> get _qualityChoice => _Choice(
+    'Quality',
+    {0: 'Auto', for (final h in _qualities) h: '${h}p'},
+    quality,
+    (q) async {
+      if (!mounted || _changingQuality || q == quality) return;
+      setState(() => quality = q);
+      if (usesMediaKit && current != null) {
+        _changingQuality = true;
+        final stream = current!;
+        final generation = _playGeneration + 1;
+        final wasPlaying = player.state.playing;
+        final selectedSubtitle = subtitle;
+        try {
+          await _play(stream, at: player.state.position);
+          if (!mounted || current != stream || generation != _playGeneration) {
+            return;
+          }
+          if (selectedSubtitle == 'Off') {
+            await _setSubtitle(SubtitleTrack.off, 'Off');
+          } else if ((current?.subtitles.any(
+                    (s) => s.label == selectedSubtitle,
+                  ) ??
+                  false) &&
+              await player.showSubtitleFile(selectedSubtitle)) {
+            if (mounted) setState(() => subtitle = selectedSubtitle);
+          } else {
+            final track = player.state.subtitles
+                .where((t) => t.name == selectedSubtitle)
+                .firstOrNull;
+            if (track != null) await _setSubtitle(track, selectedSubtitle);
+          }
+          if (!wasPlaying && mounted && generation == _playGeneration) {
+            await player.pause();
+          }
+        } catch (e) {
+          if (mounted && generation == _playGeneration) {
+            setState(() => error = e);
+          }
+        } finally {
+          _changingQuality = false;
+        }
+        return;
+      }
+      await player.setQuality(
+        q == 0 ? Settings.streamQuality : q,
+        exact: q != 0,
+      );
+    },
+  );
+
+  _Choice<double> get _speedChoice =>
+      _Choice('Speed', {for (final r in _speeds) r: '$r×'}, rate, (r) async {
+        if (!mounted) return;
+        setState(() => rate = r);
+        await player.setRate(r);
+      });
+
+  /// [choice] as a sheet (a panel on TV).
+  Future<void> _open<T>(_Choice<T> choice) async {
+    final picked = await _pick(choice.title, choice.options, choice.selected);
+    if (picked != null && mounted) await choice.pick(picked);
+  }
+
+  Future<void> _openSubtitles() => _open(_subtitleChoice);
+  Future<void> _openAudio() => _open(_audioChoice);
+  Future<void> _pickServer() => _open(_serverChoice);
+  Future<void> _pickQuality() => _open(_qualityChoice);
+  Future<void> _pickSpeed() => _open(_speedChoice);
+
+  Future<void> _setSubtitle(SubtitleTrack track, String label) async {
+    await player.setSubtitleTrack(track);
+    if (mounted) setState(() => subtitle = label);
+  }
+
+  void _onPosition(Duration position) {
+    _checkWatched(position, player.state.duration);
+    if (session.autoSkip(position) case final skip?) {
+      player.seek(skip.end);
+      _hint('Skipped ${_skipName(skip.type)}');
+    }
+    if (session.dueForSave(position)) _saveHistory();
+    if (position.inSeconds != _shownSecond) {
+      _shownSecond = position.inSeconds;
+      _refresh();
+      _publish();
+    }
+  }
+
+  /// What's playing, for the phone remote.
+  void _publish() {
+    if (current == null) return;
+    final title = episode.title;
+    nowPlaying.value = (
+      title: titleOf(widget.media),
+      episode:
+          'Episode ${epNumber(episode.number)}${title == null ? '' : ' · $title'}',
+      paused: !player.state.playing,
+      position: player.state.position,
+      duration: player.state.duration,
+    );
+  }
+
+  void _checkWatched(Duration position, Duration duration) {
+    if (session.reachedWatched(position, duration)) {
+      Analytics.event('episode_watched', {
+        'media_id': widget.media['id'],
+        'episode': episode.number,
+      });
+      _syncProgress();
+    }
+  }
+
+  /// Once the length is known, ask AniSkip; its community times replace the site's own when found.
+  void _onDuration(Duration duration) {
+    if (duration <= Duration.zero ||
+        _skipsRequested == index ||
+        Settings.skipMode == SkipMode.off) {
+      return;
+    }
+    final requested = _skipsRequested = index;
+    aniSkip(widget.media['idMal'], episode.number, duration).then((found) {
+      if (mounted && index == requested && found.isNotEmpty) {
+        setState(() => session.skips = found);
+      }
+    });
+  }
+
+  void _saveHistory([Duration? position, Duration? duration]) {
+    position ??= player.state.position;
+    duration ??= player.state.duration;
+    if (current == null) return;
+    WatchHistory.played(
+      widget.media,
+      source: _sourceName,
+      episodes: _episodes,
+      index: index,
+      position: position,
+      duration: duration,
+      dub: session.playingDub,
+      next: session.nextIndex,
+    );
+    // A download from the server reports too; offline, the next save sends the latest spot.
+    if (_sourceName == 'Jellyfin' && episode.ref is String) {
+      Jellyfin.saved()
+          ?.report(episode.ref as String, position, duration)
+          .catchError((Object _) {});
+    }
+  }
+
+  Future<void> _syncProgress() async {
+    final number = episode.number.toInt();
+    switch (await Tracker.watched(widget.media, number)) {
+      case SyncResult.skipped:
+        break;
+      case SyncResult.saved:
+        _hint(
+          'Progress updated · Episode $number',
+          icon: Icons.check_circle_rounded,
+        );
+      case SyncResult.queued:
+        _hint(
+          'Saved · syncs next time you open the app',
+          icon: Icons.cloud_off_rounded,
+        );
+    }
+  }
+
+  void _scheduleHide() {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted && player.state.playing && !_overControls) {
+        setState(() => controls = false);
+      }
+    });
+  }
+
+  void _toggleControls() {
+    setState(() => controls = !controls);
+    if (controls) _scheduleHide();
+  }
+
+  void _hint(String text, {IconData? icon, bool sticky = false}) {
+    _hintTimer?.cancel();
+    if (!mounted) return;
+    setState(() {
+      hint = text;
+      hintIcon = icon;
+    });
+    if (!sticky) {
+      _hintTimer = Timer(
+        const Duration(milliseconds: 1500),
+        () => mounted ? setState(() => hint = null) : null,
+      );
+    }
+  }
+
+  Duration _clamp(Duration t) =>
+      PlaybackSession.clamp(t, player.state.duration);
+
+  void _seekBy(int seconds) {
+    HapticFeedback.selectionClick();
+    final (:to, :total) = session.step(
+      player.state.position,
+      player.state.duration,
+      seconds,
+    );
+    player.seek(to);
+    if (!controls) _showTimeline();
+    _hint(
+      total > 0 ? '+${total}s' : '${total}s',
+      icon: total > 0 ? _forwardIcon : _replayIcon,
+    );
+  }
+
+  void _verticalDrag(DragUpdateDetails d, Size size) {
+    final delta = -d.delta.dy / (size.height * .8);
+    if (d.localPosition.dx < size.width / 2) {
+      if (!Platform.isAndroid && !Platform.isIOS) return;
+      brightness = (brightness + delta).clamp(0.0, 1.0);
+      ScreenBrightness().setApplicationScreenBrightness(brightness);
+      _hint(
+        '${(brightness * 100).round()}%',
+        icon: Icons.brightness_6_rounded,
+        sticky: true,
+      );
+    } else {
+      volume = (volume + delta).clamp(0.0, 1.0);
+      player.setVolume(volume).ignore();
+      _hint(
+        '${(volume * 100).round()}%',
+        icon: volume == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+        sticky: true,
+      );
+    }
+  }
+
+  void _clearHint([Object? _]) => _hint(hint ?? '', icon: hintIcon);
+
+  IconData get _replayIcon => switch (Settings.seekSeconds) {
+    5 => Icons.replay_5_rounded,
+    10 => Icons.replay_10_rounded,
+    30 => Icons.replay_30_rounded,
+    _ => Icons.replay_rounded,
+  };
+
+  IconData get _forwardIcon => switch (Settings.seekSeconds) {
+    5 => Icons.forward_5_rounded,
+    10 => Icons.forward_10_rounded,
+    30 => Icons.forward_30_rounded,
+    _ => Icons.forward_rounded,
+  };
+
+  /// The video, rebuilt only when the picture fit changes: the rest of the screen refreshes every second.
+  Widget? _video;
+  BoxFit? _videoFit;
+
+  Widget get _videoView {
+    if (_video == null || _videoFit != fit) {
+      _videoFit = fit;
+      _video = ExoVideo(
+        player,
+        fit: fit,
+        subtitleBottom: Settings.subtitleAppearance.bottom,
+        subtitleStyle: Settings.subtitleAppearance.style(
+          scale: isDesktop
+              ? (MediaQuery.sizeOf(context).height / 720).clamp(.8, 2.2)
+              : 1,
+        ),
+      );
+    }
+    return _video!;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // With the controls hidden, the remote's keys go to the player itself (see _onKey).
+    if ((isTv || isDesktop) && !controls && !_keys.hasPrimaryFocus) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted &&
+            !controls &&
+            ModalRoute.of(context)?.isCurrent == true &&
+            _scaffold.currentState?.isEndDrawerOpen != true) {
+          _keys.requestFocus();
+        }
+      });
+    }
+    return Focus(
+      focusNode: _keys,
+      autofocus: isTv || isDesktop,
+      onKeyEvent: (_, event) =>
+          _onKey(event) ? KeyEventResult.handled : KeyEventResult.ignored,
+      child: Theme(
+        // Controls sit on video, so they're white whatever the theme's accents.
+        data: Theme.of(context).copyWith(
+          iconButtonTheme: IconButtonThemeData(
+            style: _onVideo(
+              IconButton.styleFrom(
+                foregroundColor: Colors.white,
+                disabledForegroundColor: Colors.white30,
+              ),
+            ),
+          ),
+        ),
+        child: _player(context),
+      ),
+    );
+  }
+
+  Widget _player(BuildContext context) {
+    final size = MediaQuery.sizeOf(context);
+    final position = player.state.position;
+    final skip = session.skipButton(position);
+    final loading =
+        error == null && (current == null || player.state.buffering);
+    // A mouse clicks, wheels and hovers instead (see [_pointer]).
+    final swipes = !isDesktop && !locked && Settings.swipeGestures;
+    final hold = locked || isDesktop ? 'off' : Settings.holdGesture;
+    final upNext = _upNext(position);
+
+    // On TV, Back first hides the controls, like Netflix.
+    return PopScope(
+      canPop: !(isTv && controls && !locked),
+      // Saved on the way out, not in dispose: the page underneath reloads history as soon as this pops.
+      // Paused too, or it plays on through the exit animation over whatever comes next.
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) return setState(() => controls = false);
+        _saveHistory();
+        player.pause();
+        // Rotate back now rather than after the route is gone, so the page underneath isn't shown sideways.
+        restoreOrientation();
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      },
+      child: Scaffold(
+        key: _scaffold,
+        backgroundColor: Colors.black,
+        endDrawerEnableOpenDragGesture: false, // horizontal swipes seek
+        // Paused while the episodes are open, except on desktop, where you browse them as it plays.
+        onEndDrawerChanged: isDesktop ? null : _onDialog,
+        endDrawer: Drawer(
+          width: 400,
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          // A solid panel over the video, like every other.
+          child: Panel(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.horizontal(
+                left: Radius.circular(nested(24)),
+              ),
+            ),
+            color: scheme.surfaceContainerLow,
+            child: _EpisodeList(
+              episodes: _episodes,
+              current: index,
+              media: widget.media,
+              dub: widget.dub,
+              online: _source != null,
+              onSelect: (i) {
+                _scaffold.currentState?.closeEndDrawer();
+                if (i != index) _load(i);
+              },
+            ),
+          ),
+        ),
+        body: _pointer(
+          Stack(
+            fit: StackFit.expand,
+            children: [
+              _videoView,
+              IgnorePointer(
+                child: AnimatedOpacity(
+                  opacity: controls && !locked ? 1 : 0,
+                  duration: motionMs(context, 200),
+                  child: const DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          Color(0xB3000000),
+                          Color(0x1A000000),
+                          Color(0x1A000000),
+                          Color(0xE6000000),
+                        ],
+                        stops: [0, .28, .6, 1],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _toggleControls,
+                onDoubleTapDown: locked
+                    ? null
+                    : (d) => doubleTapX = d.localPosition.dx,
+                onDoubleTap: locked
+                    ? null
+                    : isDesktop
+                    ? _toggleFullscreen
+                    : () => _seekBy(
+                        doubleTapX < size.width / 2
+                            ? -Settings.seekSeconds
+                            : Settings.seekSeconds,
+                      ),
+                onLongPressStart: hold == 'off'
+                    ? null
+                    : (_) {
+                        HapticFeedback.mediumImpact();
+                        if (hold == 'pause') {
+                          heldPlaying = player.state.playing;
+                          player.pause();
+                          _hint(
+                            'Paused · release to play',
+                            icon: Icons.pause_rounded,
+                            sticky: true,
+                          );
+                          return;
+                        }
+                        player.setRate(2);
+                        setState(() => fastHeld = true);
+                      },
+                onLongPressEnd: hold == 'off'
+                    ? null
+                    : (_) {
+                        if (hold == 'pause') {
+                          if (heldPlaying) player.play();
+                        } else {
+                          player.setRate(rate);
+                          setState(() => fastHeld = false);
+                        }
+                        _clearHint();
+                      },
+                onVerticalDragStart: !swipes || !Platform.isAndroid
+                    ? null
+                    // may have changed with the volume keys
+                    : (_) => AndroidApp.volume()
+                          .then((v) => volume = v ?? volume)
+                          .ignore(),
+                onVerticalDragUpdate: !swipes
+                    ? null
+                    : (d) => _verticalDrag(d, size),
+                onVerticalDragEnd: !swipes ? null : _clearHint,
+                onHorizontalDragStart: !swipes
+                    ? null
+                    : (_) => seekTarget = player.state.position,
+                onHorizontalDragUpdate: !swipes
+                    ? null
+                    : (d) {
+                        seekTarget = _clamp(
+                          seekTarget! +
+                              Duration(
+                                milliseconds: (d.delta.dx * 250).round(),
+                              ),
+                        );
+                        final diff = (seekTarget! - position).inSeconds;
+                        _hint(
+                          '${formatDuration(seekTarget!)}  (${diff >= 0 ? '+' : ''}${diff}s)',
+                          sticky: true,
+                        );
+                      },
+                onHorizontalDragEnd: !swipes
+                    ? null
+                    : (_) {
+                        player.seek(seekTarget!);
+                        seekTarget = null;
+                        _clearHint();
+                      },
+              ),
+              if (loading)
+                const IgnorePointer(
+                  child: Center(
+                    child: CircularProgressIndicator(color: Colors.white),
+                  ),
+                ),
+              if (fastHeld)
+                const IgnorePointer(
+                  child: Align(
+                    alignment: Alignment(0, -.85),
+                    child: _FastForward(),
+                  ),
+                ),
+              if (hint != null)
+                IgnorePointer(
+                  child: Align(
+                    alignment: const Alignment(0, -.6),
+                    child: DecoratedBox(
+                      // Dark in every theme: it sits on the video, and its text is white.
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: .7),
+                        borderRadius: BorderRadius.circular(radiusLarge),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 12,
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (hintIcon != null) ...[
+                              Icon(hintIcon, size: 20, color: Colors.white),
+                              const SizedBox(width: 8),
+                            ],
+                            Text(
+                              hint!,
+                              style: const TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              IgnorePointer(
+                ignoring: !controls,
+                // Hidden controls can't hold D-pad focus.
+                child: ExcludeFocus(
+                  excluding: !controls,
+                  child: AnimatedOpacity(
+                    opacity: controls ? 1 : 0,
+                    duration: motionMs(context, 200),
+                    child: Focus(
+                      focusNode: _controlsNode,
+                      child: locked
+                          ? _lockedOverlay()
+                          : isTv
+                          ? _tvOverlay(position, loading)
+                          : isDesktop
+                          ? _deskOverlay(position, loading)
+                          : _overlay(position, loading),
+                    ),
+                  ),
+                ),
+              ),
+              if (_timelineShown && !controls && !locked && error == null)
+                Positioned(
+                  left: isTv ? tvMargin : 16,
+                  right: isTv ? tvMargin : 16,
+                  bottom: isTv ? 24 : 16,
+                  child: IgnorePointer(
+                    child: SafeArea(top: false, child: _timeline(position)),
+                  ),
+                ),
+              // On desktop they stay with the controls up, lifted over the bar: reaching for them with the pointer
+              // brings the controls up.
+              if (upNext != null && !locked && (isDesktop || !controls))
+                AnimatedPositioned(
+                  duration: motionMs(context, 200),
+                  right: isTv ? tvMargin : 24,
+                  bottom: isTv ? 32 : (controls ? _deskBarHeight : 24),
+                  // OK takes the offer on TV (see _onKey), so it never holds focus.
+                  child: ExcludeFocus(excluding: isTv, child: upNext),
+                )
+              else if (skip != null &&
+                  !locked &&
+                  (isDesktop ||
+                      !controls)) // elsewhere the controls have their own
+                AnimatedPositioned(
+                  duration: motionMs(context, 200),
+                  right: isTv ? tvMargin : 24,
+                  bottom: isTv ? 48 : (controls ? _deskBarHeight : 32),
+                  child: ExcludeFocus(
+                    excluding: isTv,
+                    child: FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.white,
+                        foregroundColor: Colors.black,
+                      ),
+                      onPressed: () => player.seek(skip.end),
+                      icon: const Icon(Icons.fast_forward_rounded),
+                      label: Text(
+                        'Skip ${_skipName(skip.type)}${isTv ? ' · OK' : ''}',
+                      ),
+                    ),
+                  ),
+                ),
+              if (error != null) _errorView(),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Offers the next episode during the outro or the last 20 seconds; cancelling also stops auto-play.
+  Widget? _upNext(Duration position) {
+    if (error != null) return null;
+    final offer = session.upNext(position, player.state.duration);
+    if (offer == null) return null;
+    final (:next, :remaining, :countdown) = offer;
+    return SizedBox(
+      width: 340,
+      child: Material(
+        color: const Color(0xE6141218),
+        borderRadius: BorderRadius.circular(nested(8)),
+        clipBehavior: Clip.antiAlias,
+        child: Row(
+          children: [
+            SizedBox(
+              width: 120,
+              child: AspectRatio(
+                aspectRatio: 16 / 9,
+                child: Artwork(
+                  next.thumbnail,
+                  placeholder: Center(
+                    child: Text(
+                      epNumber(next.number),
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white54,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 8, 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      countdown
+                          ? 'Next in ${remaining.inSeconds}s'
+                          : 'Up next${isTv ? ' · press OK' : ''}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.primary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    Text(
+                      'Episode ${epNumber(next.number)}${next.title == null ? '' : ' · ${next.title}'}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    if (!isTv)
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          TextButton(
+                            onPressed: () =>
+                                setState(() => session.upNextDismissed = true),
+                            child: const Text('Cancel'),
+                          ),
+                          TextButton(
+                            onPressed: () => _load(session.nextIndex),
+                            child: const Text('Play now'),
+                          ),
+                        ],
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _lockedOverlay() => SafeArea(
+    child: Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: IconButton.filledTonal(
+          tooltip: 'Unlock',
+          iconSize: 28,
+          icon: const Icon(Icons.lock_rounded),
+          onPressed: () {
+            setState(() => locked = false);
+            _scheduleHide();
+          },
+        ),
+      ),
+    ),
+  );
+
+  void _openEpisodes() {
+    if (!isTv) return _scaffold.currentState?.openEndDrawer();
+    _paused(
+      () => showDialog(
+        context: context,
+        builder: (context) => PanelDialog(
+          child: SizedBox(
+            width: 600,
+            height: MediaQuery.sizeOf(context).height * .8,
+            child: _EpisodeList(
+              episodes: _episodes,
+              current: index,
+              media: widget.media,
+              dub: widget.dub,
+              online: _source != null,
+              onSelect: (i) {
+                Navigator.pop(context);
+                if (i != index) _load(i);
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// A choice from a sheet (a panel on TV), with the controls kept up meanwhile.
+  Future<T?> _pick<T>(String title, Map<T, String> options, T current) async {
+    _hideTimer?.cancel();
+    final picked = await _paused(
+      () => pickOne(context, title, options, current),
+    );
+    _scheduleHide();
+    return picked;
+  }
+
+  /// Whether the video was playing when a dialog or the episode drawer paused it.
+  bool _openedPlaying = false;
+
+  /// Pauses while [open]'s dialog or sheet is up, and plays on afterwards if it was playing.
+  Future<T> _paused<T>(Future<T> Function() open) async {
+    _onDialog(true);
+    try {
+      return await open();
+    } finally {
+      _onDialog(false);
+    }
+  }
+
+  void _onDialog(bool open) {
+    if (open) {
+      _openedPlaying = player.state.playing;
+      if (_openedPlaying) player.pause();
+    } else if (_openedPlaying && mounted) {
+      _openedPlaying = false;
+      player.play();
+    }
+  }
+
+  /// The server playing, switchable in place (keeps the position).
+  Widget? _serverButton() {
+    if (!_canSwitchServer) return null;
+    return TextButton.icon(
+      style: _onVideo(TextButton.styleFrom(foregroundColor: Colors.white)),
+      onPressed: _pickServer,
+      icon: const Icon(Icons.dns_outlined),
+      label: Text(current!.label),
+    );
+  }
+
+  bool get _canSwitchServer => streams.length > 1 && streams.contains(current);
+
+  List<int> get _qualities => usesMediaKit
+      ? _desktopHeights
+      : player.state.heights.where((h) => h >= 480).toList();
+
+  String get _qualityLabel => quality == 0 ? 'Auto' : '${quality}p';
+
+  Widget? _qualityButton() => _qualities.length < 2
+      ? null
+      : TextButton.icon(
+          style: _onVideo(TextButton.styleFrom(foregroundColor: Colors.white)),
+          onPressed: _pickQuality,
+          icon: const Icon(Icons.high_quality_rounded),
+          label: Text(_qualityLabel),
+        );
+
+  Widget _speedButton() => TextButton.icon(
+    style: _onVideo(TextButton.styleFrom(foregroundColor: Colors.white)),
+    onPressed: _pickSpeed,
+    icon: const Icon(Icons.speed_rounded),
+    label: Text('$rate×'),
+  );
+
+  IconData get _fitIcon => switch (fit) {
+    BoxFit.cover => Icons.crop_free_rounded,
+    BoxFit.fill => Icons.open_in_full_rounded,
+    _ => Icons.fit_screen_rounded,
+  };
+
+  /// Fit, fill (crop) or stretch, a tap each.
+  void _cycleFit() {
+    final next = switch (fit) {
+      BoxFit.contain => BoxFit.cover,
+      BoxFit.cover => BoxFit.fill,
+      _ => BoxFit.contain,
+    };
+    setState(() => fit = next);
+    _hint(pictureFits[next]!, icon: Icons.aspect_ratio_rounded);
+  }
+
+  Widget _fitButton() => IconButton(
+    tooltip: 'Picture · ${pictureFits[fit]}',
+    icon: Icon(_fitIcon),
+    onPressed: _cycleFit,
+  );
+
+  Future<void> _openExternal() async {
+    if (!supportsExternalPlayer || current == null) return;
+    final generation = _playGeneration;
+    final wasPlaying = player.state.playing;
+    await player.pause();
+    final at = await _playExternal(current!, at: player.state.position);
+    if (!mounted || generation != _playGeneration) return;
+    if (at != null && at > Duration.zero) await player.seek(at);
+    if (at == null && wasPlaying) await player.play();
+  }
+
+  bool get _hasSubtitles =>
+      (current?.subtitles.isNotEmpty ?? false) ||
+      player.state.subtitles.isNotEmpty;
+
+  /// Episodes, subtitles and handing off to another app.
+  List<Widget> _menus() {
+    return [
+      if (_episodes.length > 1)
+        IconButton(
+          tooltip: 'Episodes',
+          icon: const Icon(Icons.video_library_outlined),
+          onPressed: _openEpisodes,
+        ),
+      if (_hasSubtitles)
+        IconButton(
+          tooltip: 'Subtitles · $subtitle',
+          icon: Icon(
+            subtitle == 'Off'
+                ? Icons.subtitles_off_outlined
+                : Icons.subtitles_outlined,
+          ),
+          onPressed: _openSubtitles,
+        ),
+      if (_hasAudios)
+        IconButton(
+          tooltip: 'Audio · ${audio ?? 'Auto'}',
+          icon: const Icon(Icons.audiotrack_outlined),
+          onPressed: _openAudio,
+        ),
+      if (supportsExternalPlayer)
+        IconButton(
+          tooltip: 'Open in another app',
+          icon: const Icon(Icons.open_in_new_rounded),
+          onPressed: current == null ? null : _openExternal,
+        ),
+    ];
+  }
+
+  Widget _titles({required bool tv}) {
+    final title = episode.title;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          titleOf(widget.media),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: tv ? 14 : 12, color: Colors.white70),
+        ),
+        Text(
+          'Episode ${epNumber(episode.number)}${title == null ? '' : ' · $title'}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: tv ? 28 : 18,
+            fontWeight: FontWeight.w600,
+            color: Colors.white,
+          ),
+        ),
+        if (tv)
+          Text(
+            '$_sourceName${current == null ? '' : ' · ${current!.label}'}',
+            style: const TextStyle(fontSize: 12, color: Colors.white54),
+          ),
+      ],
+    );
+  }
+
+  /// The skip for the range being played, else a fixed jump forward. On desktop the floating skip stays up over
+  /// the controls, so this one only jumps then.
+  Widget _skipButton(Duration position) {
+    final skip =
+        Settings.skipMode == SkipMode.off ||
+            (isDesktop && session.skipButton(position) != null)
+        ? null
+        : session.activeSkip(position);
+    return TextButton.icon(
+      style: _onVideo(TextButton.styleFrom(foregroundColor: Colors.white)),
+      onPressed: skip == null
+          ? () => _seekBy(Settings.skipSeconds)
+          : () => player.seek(skip.end),
+      icon: const Icon(Icons.double_arrow_rounded),
+      label: Text(
+        skip == null
+            ? '+${Settings.skipSeconds}s'
+            : 'Skip ${_skipName(skip.type)}',
+      ),
+    );
+  }
+
+  /// The position, the seek bar and the length.
+  Widget _timeline(Duration position) {
+    final duration = player.state.duration;
+    final shown = seekTarget ?? position;
+    const tabular = TextStyle(
+      color: Colors.white,
+      fontFeatures: [FontFeature.tabularFigures()],
+    );
+    return Row(
+      children: [
+        Text(formatDuration(shown), style: tabular),
+        Expanded(child: ExcludeFocus(child: _seekBar(shown, duration))),
+        Text(formatDuration(duration), style: tabular),
+      ],
+    );
+  }
+
+  /// Names the focused TV control, between the times under the seek bar.
+  final _tvLabel = ValueNotifier<String>('');
+
+  /// TV: the show and episode on a card at the top left; along the bottom a thin seek bar (it takes focus:
+  /// left/right on it scrub), the time played and left either side of the focused control's name, and one centred
+  /// row of controls, play the largest. No lock or gestures, which are for touch.
+  Widget _tvOverlay(Duration position, bool loading) {
+    final title = episode.title;
+    final duration = player.state.duration;
+    final shown = seekTarget ?? position;
+    final skip = Settings.skipMode == SkipMode.off
+        ? null
+        : session.activeSkip(position);
+    const tabular = TextStyle(
+      color: Colors.white,
+      fontSize: 16,
+      fontFeatures: [FontFeature.tabularFigures()],
+    );
+    Widget control(
+      IconData icon,
+      String label,
+      VoidCallback? onPressed, {
+      bool big = false,
+      FocusNode? focusNode,
+    }) => _TvControl(
+      icon: icon,
+      label: label,
+      onPressed: onPressed == null
+          ? null
+          : () {
+              onPressed();
+              _scheduleHide();
+            },
+      big: big,
+      focusNode: focusNode,
+      labels: _tvLabel,
+    );
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(tvMargin, 24, tvMargin, 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Align(
+            alignment: Alignment.topLeft,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: scheme.surfaceContainerHigh,
+                borderRadius: BorderRadius.circular(radiusLarge),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 14, 24, 14),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: MediaQuery.sizeOf(context).width * .45,
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        titleOf(widget.media),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 24,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                      Text(
+                        'Episode ${epNumber(episode.number)}${title == null ? '' : ': $title'}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 16,
+                          color: Colors.white70,
+                        ),
+                      ),
+                      Text(
+                        '$_sourceName${current == null ? '' : ' · ${current!.label}'}',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.white54,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const Spacer(),
+          // The skip for the range playing, where the eye already is.
+          if (skip != null)
+            Align(
+              alignment: Alignment.centerRight,
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: control(
+                  Icons.double_arrow_rounded,
+                  'Skip ${_skipName(skip.type)}',
+                  () => player.seek(skip.end),
+                ),
+              ),
+            ),
+          Focus(
+            onFocusChange: (v) {
+              if (v) _tvLabel.value = 'Seek · ◀ ▶';
+            },
+            onKeyEvent: (_, event) {
+              final key = event.logicalKey;
+              if (event is KeyUpEvent ||
+                  (key != LogicalKeyboardKey.arrowLeft &&
+                      key != LogicalKeyboardKey.arrowRight)) {
+                return KeyEventResult
+                    .ignored; // releases land the scrub in _onKey
+              }
+              _scheduleHide();
+              _scrub(event);
+              return KeyEventResult.handled;
+            },
+            child: Builder(
+              builder: (context) {
+                final focused = Focus.of(context).hasPrimaryFocus;
+                // Thin until it's the thing being moved.
+                return AnimatedScale(
+                  scale: focused ? 1 : .98,
+                  duration: motionMs(context, 150),
+                  child: AnimatedOpacity(
+                    opacity: focused ? 1 : .85,
+                    duration: motionMs(context, 150),
+                    child: ExcludeFocus(child: _seekBar(shown, duration)),
+                  ),
+                );
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              children: [
+                Text(formatDuration(shown), style: tabular),
+                Expanded(
+                  child: ValueListenableBuilder(
+                    valueListenable: _tvLabel,
+                    builder: (context, label, _) => AnimatedSwitcher(
+                      duration: motionMs(context, 150),
+                      child: Text(
+                        label,
+                        key: ValueKey(label),
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Text(
+                  duration > Duration.zero
+                      ? '-${formatDuration(duration - shown)}'
+                      : '',
+                  style: tabular,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              control(
+                Icons.skip_previous_rounded,
+                'Previous episode',
+                index > 0 ? () => _load(index - 1) : null,
+              ),
+              control(
+                Icons.fast_rewind_rounded,
+                'Back ${Settings.seekSeconds}s',
+                () => _seekBy(-Settings.seekSeconds),
+              ),
+              if (loading)
+                const SizedBox(width: _TvControl.bigSize + 16)
+              else
+                control(
+                  player.state.playing
+                      ? Icons.pause_rounded
+                      : Icons.play_arrow_rounded,
+                  player.state.playing ? 'Pause' : 'Play',
+                  player.playOrPause,
+                  big: true,
+                  focusNode: _playFocus,
+                ),
+              control(
+                Icons.fast_forward_rounded,
+                'Forward ${Settings.skipSeconds}s',
+                () => _seekBy(Settings.skipSeconds),
+              ),
+              control(
+                Icons.skip_next_rounded,
+                'Next episode',
+                hasNext ? () => _load(session.nextIndex) : null,
+              ),
+              const SizedBox(width: 24),
+              if (_episodes.length > 1)
+                control(
+                  Icons.video_library_outlined,
+                  'Episodes',
+                  _openEpisodes,
+                ),
+              if (_hasSubtitles)
+                control(
+                  subtitle == 'Off'
+                      ? Icons.subtitles_off_outlined
+                      : Icons.subtitles_outlined,
+                  'Subtitles · $subtitle',
+                  _openSubtitles,
+                ),
+              if (_hasAudios)
+                control(
+                  Icons.audiotrack_outlined,
+                  'Audio · ${audio ?? 'Auto'}',
+                  _openAudio,
+                ),
+              if (_canSwitchServer)
+                control(
+                  Icons.dns_outlined,
+                  'Server · ${current!.label}',
+                  _pickServer,
+                ),
+              if (_qualities.length > 1)
+                control(
+                  Icons.high_quality_rounded,
+                  'Quality · $_qualityLabel',
+                  _pickQuality,
+                ),
+              control(Icons.speed_rounded, 'Speed · $rate×', _pickSpeed),
+              control(_fitIcon, 'Picture · ${pictureFits[fit]}', _cycleFit),
+              if (supportsExternalPlayer)
+                control(
+                  Icons.open_in_new_rounded,
+                  'Open in another app',
+                  current == null ? null : _openExternal,
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _overlay(Duration position, bool loading) => SafeArea(
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              IconButton(
+                tooltip: 'Back',
+                icon: const Icon(Icons.arrow_back_rounded),
+                onPressed: () => Navigator.pop(context),
+              ),
+              const SizedBox(width: 4),
+              Expanded(child: _titles(tv: false)),
+              ..._menus(),
+            ],
+          ),
+          const Spacer(),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              _RoundButton(
+                Icons.skip_previous_rounded,
+                index > 0 ? () => _load(index - 1) : null,
+                tooltip: 'Previous episode',
+              ),
+              const SizedBox(width: 32),
+              _RoundButton(
+                _replayIcon,
+                () => _seekBy(-Settings.seekSeconds),
+                tooltip: 'Back ${Settings.seekSeconds}s',
+              ),
+              const SizedBox(width: 32),
+              loading
+                  ? const SizedBox(width: 80, height: 80)
+                  : _RoundButton(
+                      player.state.playing
+                          ? Icons.pause_rounded
+                          : Icons.play_arrow_rounded,
+                      () {
+                        player.playOrPause();
+                        _scheduleHide();
+                      },
+                      tooltip: player.state.playing ? 'Pause' : 'Play',
+                      big: true,
+                      focusNode: _playFocus,
+                    ),
+              const SizedBox(width: 32),
+              _RoundButton(
+                _forwardIcon,
+                () => _seekBy(Settings.seekSeconds),
+                tooltip: 'Forward ${Settings.seekSeconds}s',
+              ),
+              const SizedBox(width: 32),
+              _RoundButton(
+                Icons.skip_next_rounded,
+                hasNext ? () => _load(session.nextIndex) : null,
+                tooltip: 'Next episode',
+              ),
+            ],
+          ),
+          const Spacer(),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: _timeline(position),
+          ),
+          Row(
+            children: [
+              IconButton(
+                tooltip: 'Lock controls',
+                icon: const Icon(Icons.lock_open_rounded),
+                onPressed: () => setState(() => locked = true),
+              ),
+              _skipButton(position),
+              const Spacer(),
+              ?_serverButton(),
+              ?_qualityButton(),
+              _speedButton(),
+              _fitButton(),
+            ],
+          ),
+        ],
+      ),
+    ),
+  );
+
+  /// A slider with the intro (amber) and outro (sky) ranges drawn over its track.
+  Widget _seekBar(Duration shown, Duration duration) => LayoutBuilder(
+    builder: (context, constraints) {
+      final max = duration.inMilliseconds.toDouble().clamp(
+        1.0,
+        double.infinity,
+      );
+      const inset = 16.0; // the slider insets its track by the overlay radius
+      final track = constraints.maxWidth - inset * 2;
+      double fraction(Duration d) =>
+          (d.inMilliseconds / duration.inMilliseconds)
+              .clamp(0.0, 1.0)
+              .toDouble();
+      return MouseRegion(
+        onHover: isDesktop
+            ? (e) => _seekHover.value = ((e.localPosition.dx - inset) / track)
+                  .clamp(0.0, 1.0)
+            : null,
+        onExit: isDesktop ? (_) => _seekHover.value = null : null,
+        child: Stack(
+          alignment: Alignment.centerLeft,
+          clipBehavior: Clip.none,
+          children: [
+            SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 4,
+                activeTrackColor: Theme.of(context).colorScheme.primary,
+                thumbColor: Colors.white,
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+                overlayShape: const RoundSliderOverlayShape(
+                  overlayRadius: inset,
+                ),
+                secondaryActiveTrackColor: Colors.white38,
+                inactiveTrackColor: Colors.white24,
+              ),
+              child: Slider(
+                max: max,
+                value: shown.inMilliseconds.toDouble().clamp(0, max),
+                secondaryTrackValue: player.state.buffer.inMilliseconds
+                    .toDouble()
+                    .clamp(0, max),
+                onChangeStart: (_) => _hideTimer?.cancel(),
+                onChanged: (v) => setState(
+                  () => seekTarget = Duration(milliseconds: v.round()),
+                ),
+                onChangeEnd: (v) {
+                  player.seek(Duration(milliseconds: v.round()));
+                  seekTarget = null;
+                  _scheduleHide();
+                },
+              ),
+            ),
+            if (duration > Duration.zero)
+              for (final s in skips.where((s) => s.type != SkipType.recap))
+                Positioned(
+                  left: inset + track * fraction(s.start),
+                  width: track * (fraction(s.end) - fraction(s.start)),
+                  child: IgnorePointer(
+                    child: Container(
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color:
+                            (s.type == SkipType.intro
+                                    ? const Color(0xFFFFC857)
+                                    : const Color(0xFF7DD3FC))
+                                .withValues(alpha: .9),
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                ),
+            // Desktop: the time under the pointer.
+            if (isDesktop && duration > Duration.zero)
+              ValueListenableBuilder(
+                valueListenable: _seekHover,
+                builder: (context, at, _) => at == null
+                    ? const SizedBox()
+                    : Positioned(
+                        left: inset + track * at - 28,
+                        bottom: 36,
+                        width: 56,
+                        child: IgnorePointer(
+                          child: Text(
+                            formatDuration(duration * at),
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
+                              shadows: [Shadow(blurRadius: 6)],
+                            ),
+                          ),
+                        ),
+                      ),
+              ),
+          ],
+        ),
+      );
+    },
+  );
+
+  Widget _errorView() {
+    final challenge = error is CloudflareChallenge;
+    return ColoredBox(
+      color: Colors.black87,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.error_outline_rounded,
+                size: 48,
+                color: Theme.of(context).colorScheme.error,
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                "Couldn't play this episode",
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                friendlyError(error!),
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70),
+              ),
+              const SizedBox(height: 24),
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                alignment: WrapAlignment.center,
+                children: [
+                  OutlinedButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Back'),
+                  ),
+                  FilledButton(
+                    autofocus: isTv,
+                    onPressed: () => _load(index),
+                    child: Text(challenge ? 'Verify' : 'Try again'),
+                  ),
+                  if (_source != null && !challenge)
+                    FilledButton.tonal(
+                      onPressed: _switchSite,
+                      child: const Text('Try another site'),
+                    ),
+                  if (hasNext)
+                    FilledButton.tonal(
+                      onPressed: () => _load(session.nextIndex),
+                      child: const Text('Next episode'),
+                    ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The episodes in the order chosen on the details page (a shared setting), with a jump-to-number field for long
+/// shows. Opens on the one playing.
+class _EpisodeList extends StatefulWidget {
+  const _EpisodeList({
+    required this.episodes,
+    required this.current,
+    required this.media,
+    required this.dub,
+    required this.online,
+    required this.onSelect,
+  });
+
+  final List<Episode> episodes;
+  final int current;
+  final Map media;
+
+  /// The audio playing, and whether the site can be reached: which downloads would play (see [Downloads.toPlay]).
+  final bool dub, online;
+  final ValueChanged<int> onSelect;
+
+  @override
+  State<_EpisodeList> createState() => _EpisodeListState();
+}
+
+class _EpisodeListState extends State<_EpisodeList> {
+  static const _extent = 88.0;
+  static const _jumpAt = 50; // shorter lists are quick to scroll
+  bool newestFirst = Settings.newestFirst;
+  late final scroll = ScrollController(
+    initialScrollOffset: _offsetOf(widget.current),
+  );
+
+  /// Row of episode [i] in the current order.
+  int _row(int i) => EpisodePlan.rowFor(i, widget.episodes.length, newestFirst);
+
+  double _offsetOf(int i) =>
+      EpisodePlan.offsetFor(i, widget.episodes.length, newestFirst, _extent);
+
+  void _jump(String text) {
+    final i = EpisodePlan.indexOfNumber(widget.episodes, text);
+    if (i == null) return;
+    scroll.animateTo(
+      _offsetOf(i),
+      duration: motionMs(context, 300),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  @override
+  void dispose() {
+    scroll.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final episodes = widget.episodes;
+    final colors = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    final progress = Show(widget.media).progress;
+    return SafeArea(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 16, 12, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Episodes · ${episodes.length}',
+                    style: text.titleLarge,
+                  ),
+                ),
+                if (episodes.length > _jumpAt)
+                  SizedBox(
+                    width: 112,
+                    child: TextField(
+                      keyboardType: TextInputType.number,
+                      textInputAction: TextInputAction.go,
+                      onSubmitted: _jump,
+                      decoration: const InputDecoration(
+                        hintText: 'Go to EP',
+                        isDense: true,
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 10,
+                        ),
+                      ),
+                    ),
+                  ),
+                IconButton(
+                  tooltip: newestFirst ? 'Newest first' : 'Oldest first',
+                  icon: const Icon(Icons.swap_vert_rounded),
+                  onPressed: () {
+                    setState(
+                      () => Settings.newestFirst = newestFirst = !newestFirst,
+                    );
+                    scroll.jumpTo(_offsetOf(widget.current));
+                  },
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ListView.builder(
+              controller: scroll,
+              padding: const EdgeInsets.only(bottom: 16),
+              itemCount: episodes.length,
+              itemExtent: _extent,
+              itemBuilder: (context, row) {
+                final i = _row(row);
+                final e = episodes[i];
+                final playing = i == widget.current;
+                return ScrollIntoViewOnFocus(
+                  child: ListTile(
+                    autofocus: isTv && playing,
+                    selected: playing,
+                    // Quieter than the focus highlight, so the row the remote is on always stands out.
+                    selectedTileColor: colors.primary.withValues(alpha: .08),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                    onTap: () => widget.onSelect(i),
+                    leading: ClipRRect(
+                      borderRadius: BorderRadius.circular(radiusMedium),
+                      child: SizedBox(
+                        width: 112,
+                        child: AspectRatio(
+                          aspectRatio: 16 / 9,
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              Artwork(
+                                e.thumbnail,
+                                placeholder: Center(
+                                  child: Text(
+                                    epNumber(e.number),
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                      color: colors.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              if (playing)
+                                const ColoredBox(
+                                  color: Color(0x88000000),
+                                  child: Icon(
+                                    Icons.graphic_eq_rounded,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    title: Text('Episode ${epNumber(e.number)}'),
+                    subtitle: e.title == null
+                        ? null
+                        : Text(
+                            e.title!,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (Downloads.instance.toPlay(
+                              widget.media,
+                              e.number,
+                              dub: widget.dub,
+                              online: widget.online,
+                            ) !=
+                            null)
+                          const Icon(Icons.download_done_rounded, size: 18),
+                        if (EpisodePlan.isWatched(e, progress))
+                          const Padding(
+                            padding: EdgeInsets.only(left: 8),
+                            child: Icon(Icons.check_circle_rounded, size: 18),
+                          ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _skipName(SkipType type) => switch (type) {
+  SkipType.intro => 'intro',
+  SkipType.outro => 'outro',
+  SkipType.recap => 'recap',
+};
+
+/// A TV player control: an icon in a circle, ringed in the accent and a touch larger while focused, naming
+/// itself in [labels] (shown between the times) so the row needs no text of its own.
+/// Holding for 2×: "2×" and three chevrons lighting up in turn, left to right, for as long as the finger stays down.
+class _FastForward extends StatefulWidget {
+  const _FastForward();
+
+  @override
+  State<_FastForward> createState() => _FastForwardState();
+}
+
+class _FastForwardState extends State<_FastForward>
+    with SingleTickerProviderStateMixin {
+  late final wave = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  );
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (MediaQuery.disableAnimationsOf(context)) {
+      wave.value = 0;
+    } else if (!wave.isAnimating) {
+      wave.repeat();
+    }
+  }
+
+  @override
+  void dispose() {
+    wave.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => DecoratedBox(
+    decoration: BoxDecoration(
+      color: Colors.black.withValues(alpha: .6),
+      borderRadius: BorderRadius.circular(999),
+    ),
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(16, 6, 10, 6),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text(
+            '2×',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(width: 4),
+          AnimatedBuilder(
+            animation: wave,
+            builder: (context, _) => Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (var i = 0; i < 3; i++)
+                  Opacity(
+                    // Each chevron brightens as the wave reaches it, then fades.
+                    opacity: switch ((wave.value * 3 - i) % 3) {
+                      final phase when phase < 1 => 1 - phase * .7,
+                      _ => .3,
+                    },
+                    child: const Icon(
+                      Icons.play_arrow_rounded,
+                      size: 20,
+                      color: Colors.white,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _TvControl extends StatefulWidget {
+  const _TvControl({
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+    required this.labels,
+    this.big = false,
+    this.focusNode,
+  });
+
+  static const size = 52.0, bigSize = 72.0;
+
+  final IconData icon;
+  final String label;
+  final VoidCallback? onPressed;
+  final ValueNotifier<String> labels;
+  final bool big;
+  final FocusNode? focusNode;
+
+  @override
+  State<_TvControl> createState() => _TvControlState();
+}
+
+class _TvControlState extends State<_TvControl> {
+  bool focused = false;
+
+  @override
+  void didUpdateWidget(_TvControl old) {
+    super.didUpdateWidget(old);
+    // Play turning into Pause while focused renames it.
+    if (focused && old.label != widget.label) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => widget.labels.value = widget.label,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final size = widget.big ? _TvControl.bigSize : _TvControl.size;
+    final enabled = widget.onPressed != null;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      child: Semantics(
+        button: true,
+        label: widget.label,
+        child: InkWell(
+          focusNode: widget.focusNode,
+          customBorder: const CircleBorder(),
+          focusColor: Colors.transparent,
+          onTap: widget.onPressed,
+          onFocusChange: (v) {
+            setState(() => focused = v);
+            if (v) widget.labels.value = widget.label;
+          },
+          child: AnimatedScale(
+            scale: focused ? 1.1 : 1,
+            duration: motionMs(context, 150),
+            curve: Curves.easeOutCubic,
+            child: AnimatedContainer(
+              duration: motionMs(context, 150),
+              width: size,
+              height: size,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                // Solid when focused, and always behind play; the rest are icons alone.
+                color: focused || widget.big
+                    ? scheme.surfaceContainerHigh
+                    : Colors.transparent,
+                border: Border.all(
+                  color: focused ? scheme.primary : Colors.transparent,
+                  width: 3,
+                ),
+                boxShadow: focused ? accentGlow(.35, 16) : const [],
+              ),
+              child: Icon(
+                widget.icon,
+                size: widget.big ? 40 : 28,
+                color: enabled ? Colors.white : Colors.white30,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A round transport control: translucent on video, solid when focused on TV (from the theme).
+class _RoundButton extends StatelessWidget {
+  const _RoundButton(
+    this.icon,
+    this.onPressed, {
+    required this.tooltip,
+    this.big = false,
+    this.focusNode,
+  });
+
+  final IconData icon;
+  final VoidCallback? onPressed;
+  final String tooltip;
+  final bool big;
+  final FocusNode? focusNode;
+
+  @override
+  Widget build(BuildContext context) => IconButton(
+    tooltip: tooltip,
+    onPressed: onPressed,
+    focusNode: focusNode,
+    iconSize: big ? 48 : 30,
+    padding: EdgeInsets.all(big ? 16 : 8),
+    style: _onVideo(
+      IconButton.styleFrom(
+        backgroundColor: big ? scheme.surfaceContainerHigh : Colors.transparent,
+        foregroundColor: Colors.white,
+        disabledForegroundColor: Colors.white24,
+      ),
+    ),
+    icon: Icon(icon),
+  );
+}
+
+/// [base] for controls over video; on TV it still turns solid white with dark content when focused.
+ButtonStyle _onVideo(ButtonStyle base) {
+  if (!isTv) return base;
+  bool focused(Set<WidgetState> s) => s.contains(WidgetState.focused);
+  return base.copyWith(
+    backgroundColor: WidgetStateProperty.resolveWith(
+      (s) => focused(s) ? Colors.white : base.backgroundColor?.resolve(s),
+    ),
+    foregroundColor: WidgetStateProperty.resolveWith(
+      (s) => focused(s) ? Colors.black : base.foregroundColor?.resolve(s),
+    ),
+    iconColor: WidgetStateProperty.resolveWith(
+      (s) => focused(s) ? Colors.black : base.iconColor?.resolve(s),
+    ),
+    overlayColor: WidgetStateProperty.resolveWith(
+      (s) => focused(s) ? Colors.transparent : base.overlayColor?.resolve(s),
+    ),
+  );
+}
+
+String formatDuration(Duration d) {
+  final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+  final m = d.inMinutes.remainder(60);
+  return d.inHours > 0
+      ? '${d.inHours}:${m.toString().padLeft(2, '0')}:$s'
+      : '$m:$s';
+}
+
+/// One of the player's choices: a sheet on phones and TV, a menu on desktop.
+class _Choice<T> {
+  const _Choice(this.title, this.options, this.selected, this.pick);
+  final String title;
+  final Map<T, String> options;
+  final T selected;
+  final Future<void> Function(T) pick;
+}

@@ -1,0 +1,44 @@
+name: aniview
+description: "AniView: watch and track anime with AniList or MyAnimeList."
+publish_to: 'none'
+version: 2.6.1+37
+
+environment:
+  sdk: ^3.13.3
+
+dependencies:
+  app_links: ^7.2.1
+  file_selector: ^1.1.0
+  flutter:
+    sdk: flutter
+  flutter_inappwebview: ^6.2.0-beta.3
+  http: ^1.6.0
+  http2: ^2.3.1
+  media_kit: ^1.2.6
+  media_kit_libs_ios_video: ^1.1.4
+  media_kit_libs_linux: ^1.2.1
+  media_kit_libs_macos_video: ^1.1.4
+  media_kit_libs_windows_video: ^1.0.11
+  media_kit_video: ^2.0.1
+  package_info_plus: ^10.2.2
+  path: ^1.9.1
+  path_provider: ^2.1.6
+  pointycastle: ^4.0.0
+  screen_brightness: ^2.1.11
+  shared_preferences: ^2.5.5
+  window_manager: ^0.5.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon/aniview_app_icon.png
+    - assets/icon/aniview_icon.png
+    - assets/icon/aniview_wordmark.png
+    - assets/icon/aniview_wordmark_light.png
