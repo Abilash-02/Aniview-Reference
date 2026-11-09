@@ -73,7 +73,16 @@ jobs:
 
       - name: Build Android Debug APK
         working-directory: aniview-main
-        run: flutter build apk --debug "--dart-define=TOP_SITES=$TOP_SITES"
+        env:
+          ANILIST_CLIENT_ID: ${{ vars.ANILIST_CLIENT_ID }}
+        run: |
+          if [ -z "$ANILIST_CLIENT_ID" ]; then
+            echo "::error::ANILIST_CLIENT_ID repository variable is not set"
+            exit 1
+          fi
+          flutter build apk --debug \
+            "--dart-define=TOP_SITES=$TOP_SITES" \
+            "--dart-define=ANILIST_CLIENT_ID=$ANILIST_CLIENT_ID"
 
       - name: Verify TOP_SITES configuration in APK
         working-directory: aniview-main
@@ -87,6 +96,27 @@ jobs:
                   print("SUCCESS: TOP_SITES verified in kernel_blob.bin")
               else:
                   print("FAILURE: TOP_SITES not found in kernel_blob.bin", file=sys.stderr)
+                  sys.exit(1)
+          '
+
+      - name: Verify AniList Client ID configuration in APK
+        working-directory: aniview-main
+        env:
+          ANILIST_CLIENT_ID: ${{ vars.ANILIST_CLIENT_ID }}
+        run: |
+          python3 -c '
+          import zipfile, sys, os
+          expected_id = os.environ.get("ANILIST_CLIENT_ID", "").strip()
+          if not expected_id:
+              print("FAILURE: ANILIST_CLIENT_ID environment variable is missing", file=sys.stderr)
+              sys.exit(1)
+          apk = "build/app/outputs/flutter-apk/app-debug.apk"
+          with zipfile.ZipFile(apk, "r") as z:
+              kernel = z.read("assets/flutter_assets/kernel_blob.bin")
+              if expected_id.encode("utf-8") in kernel:
+                  print("SUCCESS: AniList Client ID verified in APK kernel_blob.bin")
+              else:
+                  print("FAILURE: AniList Client ID not found in APK kernel_blob.bin", file=sys.stderr)
                   sys.exit(1)
           '
 

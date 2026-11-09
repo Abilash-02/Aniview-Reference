@@ -186,7 +186,11 @@ class AniList {
           title: 'Sign in with AniList',
           url:
               'https://anilist.co/api/v2/oauth/authorize?client_id=$clientId&response_type=token',
-          pick: (uri) => Uri.splitQueryString(uri.fragment)['access_token'],
+          pick: (uri) {
+            final fragment = Uri.splitQueryString(uri.fragment);
+            return fragment['access_token'] ??
+                uri.queryParameters['access_token'];
+          },
         ),
       ),
     );
@@ -640,7 +644,7 @@ class AniList {
   }
 }
 
-/// A tracker's authorize page in-app; closes with whatever [pick] reads from the `aniview://` redirect.
+/// A tracker's authorize page in-app; closes with whatever [pick] reads from the redirect.
 class LoginPage extends StatefulWidget {
   const LoginPage({
     super.key,
@@ -659,15 +663,46 @@ class LoginPage extends StatefulWidget {
 class _LoginPageState extends State<LoginPage> {
   bool _done = false;
 
+  void _check(Uri uri) {
+    if (_done) return;
+    final isCustomScheme = uri.scheme == 'aniview';
+    final isPinRedirect =
+        (uri.host == 'anilist.co' || uri.host == 'www.anilist.co') &&
+            uri.path.startsWith('/api/v2/oauth/pin');
+    if (!isCustomScheme && !isPinRedirect) return;
+
+    final token = widget.pick(uri);
+    if (token != null && token.isNotEmpty) {
+      _done = true;
+      Navigator.pop(context, token);
+    }
+  }
+
   NavigationActionPolicy _intercept(WebUri? url) {
-    if (url == null || url.scheme != 'aniview') {
+    if (url == null) return NavigationActionPolicy.ALLOW;
+    final uri = Uri.parse('$url');
+    final isCustomScheme = uri.scheme == 'aniview';
+    final isPinRedirect =
+        (uri.host == 'anilist.co' || uri.host == 'www.anilist.co') &&
+            uri.path.startsWith('/api/v2/oauth/pin');
+
+    if (!isCustomScheme && !isPinRedirect) {
       return NavigationActionPolicy.ALLOW;
     }
-    if (!_done) {
-      _done = true;
-      Navigator.pop(context, widget.pick(Uri.parse('$url')));
+
+    final token = widget.pick(uri);
+    if (token != null && token.isNotEmpty) {
+      if (!_done) {
+        _done = true;
+        Navigator.pop(context, token);
+      }
+      return NavigationActionPolicy.CANCEL;
     }
-    return NavigationActionPolicy.CANCEL;
+
+    if (isCustomScheme) {
+      return NavigationActionPolicy.CANCEL;
+    }
+    return NavigationActionPolicy.ALLOW;
   }
 
   @override
@@ -678,6 +713,12 @@ class _LoginPageState extends State<LoginPage> {
       initialSettings: InAppWebViewSettings(useShouldOverrideUrlLoading: true),
       shouldOverrideUrlLoading: (_, action) async =>
           _intercept(action.request.url),
+      onUpdateVisitedHistory: (_, url, __) {
+        if (url != null) _check(Uri.parse('$url'));
+      },
+      onLoadStart: (_, url) {
+        if (url != null) _check(Uri.parse('$url'));
+      },
     ),
   );
 }

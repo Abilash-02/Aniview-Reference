@@ -408,6 +408,53 @@ void main() {
       expect((await Tracker.search('', ecchi)).$1, hasLength(1));
       expect((await Tracker.search('x', const SearchFilters())).$1, isEmpty);
     });
+
+    group('AniList OAuth & client id configuration', () {
+      test('pin redirect extracts token from fragment and query', () {
+        final pinUri = Uri.parse(
+          'https://anilist.co/api/v2/oauth/pin#access_token=test_pin_token&token_type=Bearer',
+        );
+        final fragment = Uri.splitQueryString(pinUri.fragment);
+        final token =
+            fragment['access_token'] ?? pinUri.queryParameters['access_token'];
+        expect(token, 'test_pin_token');
+
+        final queryUri = Uri.parse(
+          'https://anilist.co/api/v2/oauth/pin?access_token=test_query_token',
+        );
+        final fragment2 = Uri.splitQueryString(queryUri.fragment);
+        final token2 =
+            fragment2['access_token'] ??
+            queryUri.queryParameters['access_token'];
+        expect(token2, 'test_query_token');
+      });
+
+      test('AniList token lifecycle and viewer profile query', () async {
+        SharedPreferences.setMockInitialValues({});
+        await AniList.useToken('mock_access_token');
+        expect(AniList.token, 'mock_access_token');
+
+        AniList.transport = (query, variables) async {
+          expect(query, contains('Viewer'));
+          return {
+            'Viewer': {
+              'id': 12345,
+              'name': 'AnizenUser',
+              'avatar': {'large': 'https://example.com/avatar.png'},
+            },
+          };
+        };
+        addTearDown(() => AniList.transport = null);
+
+        final viewer = await AniList.viewer();
+        expect(viewer?['name'], 'AnizenUser');
+        expect(viewer?['id'], 12345);
+
+        await AniList.logout();
+        expect(AniList.token, isNull);
+        expect(await AniList.viewer(), isNull);
+      });
+    });
   });
 }
 
