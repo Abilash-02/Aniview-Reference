@@ -43,9 +43,43 @@ jobs:
         working-directory: aniview-main
         run: flutter pub get
 
+      - name: Generate and validate TOP_SITES configuration
+        working-directory: aniview-main
+        run: |
+          top_sites=$(dart tool/top_sites.dart)
+          if [ -z "$top_sites" ]; then
+            echo "::error::TOP_SITES is empty"
+            exit 1
+          fi
+          if [[ "$top_sites" != *"|http"* ]] || [[ "$top_sites" != *";"* ]]; then
+            echo "::error::TOP_SITES format is malformed: $top_sites"
+            exit 1
+          fi
+          echo "Generated TOP_SITES (${#top_sites} characters)"
+          {
+            echo "TOP_SITES<<EOF"
+            echo "$top_sites"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
       - name: Build Android Debug APK
         working-directory: aniview-main
-        run: flutter build apk --debug
+        run: flutter build apk --debug "--dart-define=TOP_SITES=$TOP_SITES"
+
+      - name: Verify TOP_SITES configuration in APK
+        working-directory: aniview-main
+        run: |
+          python3 -c '
+          import zipfile, sys
+          apk = "build/app/outputs/flutter-apk/app-debug.apk"
+          with zipfile.ZipFile(apk, "r") as z:
+              kernel = z.read("assets/flutter_assets/kernel_blob.bin")
+              if b"reanime.to" in kernel or b"anikototv.to" in kernel:
+                  print("SUCCESS: TOP_SITES verified in kernel_blob.bin")
+              else:
+                  print("FAILURE: TOP_SITES not found in kernel_blob.bin", file=sys.stderr)
+                  sys.exit(1)
+          '
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
