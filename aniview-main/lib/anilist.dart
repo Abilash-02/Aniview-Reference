@@ -713,7 +713,7 @@ class _LoginPageState extends State<LoginPage> {
       initialSettings: InAppWebViewSettings(useShouldOverrideUrlLoading: true),
       shouldOverrideUrlLoading: (_, action) async =>
           _intercept(action.request.url),
-      onUpdateVisitedHistory: (_, url, __) {
+      onUpdateVisitedHistory: (_, url, _) {
         if (url != null) _check(Uri.parse('$url'));
       },
       onLoadStart: (_, url) {
