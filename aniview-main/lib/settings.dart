@@ -147,7 +147,7 @@ enum HomeSection {
   ),
   watching('Continue watching', 'The rest of your watching list'),
   planning('Plan to watch', 'Your planning list'),
-  recent('Recently watched', 'Where you stopped, on this device'),
+  recent('Continue watching', 'Where you stopped, on this device'),
   jellyfin('On your Jellyfin', 'Added to your Jellyfin server lately'),
   season('This season', 'Popular shows this season'),
   trending('Trending now', 'Trending on AniList'),
@@ -187,6 +187,7 @@ enum HomeSection {
   /// On until the user changes the sections; the rest start off.
   bool get byDefault => const {
     featured,
+    recent,
     airing,
     watching,
     jellyfin,

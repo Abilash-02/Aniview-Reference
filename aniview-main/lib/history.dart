@@ -25,12 +25,19 @@ extension type const WatchRecord(Map<String, dynamic> raw) {
 
   /// When it was saved, in milliseconds since the epoch; missing on entries from before it was kept.
   int? get savedAt => raw['at'];
+
+  String? get episodeId => raw['episodeId'] as String?;
+  String? get episodeTitle => raw['episodeTitle'] as String?;
+  String? get episodeThumbnail => raw['episodeThumbnail'] as String?;
 }
 
 /// Watch progress: where the user stopped in each show (newest first, on-device, mirrored to the TV launcher's
 /// Continue watching row), what counts as a finished episode, and what that means for a show's episode list.
 class WatchHistory {
   static const _key = 'watch_history';
+
+  /// Minimum playback position required for an episode to appear in Continue Watching.
+  static const continueWatchingThreshold = Duration(seconds: 12);
 
   /// The latest write; reads wait for it so a page never sees history from before the player's last save.
   static Future<void> _writing = Future.value();
@@ -104,25 +111,22 @@ class WatchHistory {
     required bool dub,
     required int next,
   }) async {
-    if (position < const Duration(seconds: 5)) return;
+    if (position < continueWatchingThreshold) return;
     if (!finished(position, duration)) {
+      final ep = index < episodes.length ? episodes[index] : null;
       return _save(
         media,
         source: source,
-        episode: episodes[index].number,
+        episode: ep?.number ?? (index < episodes.length ? episodes[index].number : 1),
         position: position,
         duration: duration,
         dub: dub,
+        episodeId: ep?.ref.toString(),
+        episodeTitle: ep?.title,
+        episodeThumbnail: ep?.thumbnail,
       );
     }
-    if (next >= episodes.length) return _remove(media);
-    await _save(
-      media,
-      source: source,
-      episode: episodes[next].number,
-      position: Duration.zero,
-      dub: dub,
-    );
+    return _remove(media);
   }
 
   static Future<void> _save(
@@ -132,20 +136,40 @@ class WatchHistory {
     required Duration position,
     Duration? duration,
     required bool dub,
+    String? episodeId,
+    String? episodeTitle,
+    String? episodeThumbnail,
   }) async {
     final entries = [
       {
         'media': media,
         'source': source,
         'episode': episode,
+        if (episodeId != null) 'episodeId': episodeId,
+        if (episodeTitle != null) 'episodeTitle': episodeTitle,
+        if (episodeThumbnail != null) 'episodeThumbnail': episodeThumbnail,
         'position': position.inMilliseconds,
-        'duration': ?duration?.inMilliseconds,
+        if (duration != null) 'duration': duration.inMilliseconds,
         'dub': dub,
         'at': DateTime.now().millisecondsSinceEpoch,
       },
       ...(await _read()).where((r) => !Show(r['media']).sameAs(media)),
     ];
     await _write(entries.take(20).toList());
+  }
+
+  static bool isContinueWatching(WatchRecord r) {
+    if (r.position < continueWatchingThreshold) return false;
+    final dur = r.duration;
+    if (dur != null && dur > Duration.zero && finished(r.position, dur)) {
+      return false;
+    }
+    return true;
+  }
+
+  static Future<List<WatchRecord>> continueWatching() async {
+    final allRecords = await all();
+    return allRecords.where(isContinueWatching).toList();
   }
 
   static Future<void> remove(Map media) async {

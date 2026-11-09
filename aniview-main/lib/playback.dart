@@ -112,6 +112,7 @@ class PlaybackSession {
     upNextDismissed = false;
     _autoSkipped.clear();
     _watched = false;
+    _savedAt = Duration.zero;
     fromDownload = false;
   }
 
@@ -245,8 +246,16 @@ class PlaybackSession {
     return _watched = WatchHistory.finished(position, duration);
   }
 
-  /// Whether the spot has moved enough (10 s) since it was last saved.
+  /// Whether the spot has moved enough (10 s) since it was last saved, or reached the 12-second threshold.
   bool dueForSave(Duration position) {
+    if (_savedAt < WatchHistory.continueWatchingThreshold &&
+        position >= WatchHistory.continueWatchingThreshold) {
+      _savedAt = position;
+      return true;
+    }
+    if (position < WatchHistory.continueWatchingThreshold) {
+      return false;
+    }
     if ((position - _savedAt).abs() < const Duration(seconds: 10)) return false;
     _savedAt = position;
     return true;

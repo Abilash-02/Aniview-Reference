@@ -882,16 +882,21 @@ class _HomeFeed extends StatelessWidget {
     future: feed.trending,
     builder: (context, snap) {
       final offline = snap.hasError && _downloaded.isNotEmpty;
+      final hasRecentSection = Settings.homeSections.any(
+        (s) => s.$1 == HomeSection.recent && s.$2,
+      );
       final rows = <Widget>[
         // Offline: go straight to what can play.
         if (offline) ...[
           _OfflineBanner(onRetry: onRefresh),
-          _recentlyWatched(),
+          _continueWatching(),
           MediaRow('Downloaded', _downloaded, onBack: onReload),
-        ] else
+        ] else ...[
+          if (!hasRecentSection) _continueWatching(),
           for (final (section, shown) in Settings.homeSections)
             if (shown && !(isTv && section == HomeSection.featured))
               _section(context, section, snap),
+        ],
       ];
       return isTv ? _tv(context, snap, rows) : _phone(context, snap, rows);
     },
@@ -910,7 +915,8 @@ class _HomeFeed extends StatelessWidget {
       floatingActionButton: FutureBuilder(
         future: feed.history,
         builder: (context, snap) {
-          final record = snap.data?.firstOrNull;
+          final all = snap.data ?? const [];
+          final record = all.where(WatchHistory.isContinueWatching).firstOrNull;
           if (record == null) return const SizedBox.shrink();
           return ClearOfNav(
             page: page,
@@ -1161,7 +1167,7 @@ class _HomeFeed extends StatelessWidget {
                 );
         },
       ),
-      HomeSection.recent => _recentlyWatched(autofocus: first),
+      HomeSection.recent => _continueWatching(autofocus: first),
       // Not even a placeholder while no server is connected.
       HomeSection.jellyfin when Settings.jellyfinToken.isNotEmpty => _row(
         context,
@@ -1198,34 +1204,21 @@ class _HomeFeed extends StatelessWidget {
     };
   }
 
-  Widget _recentlyWatched({bool autofocus = false}) => FutureBuilder(
-    future: feed.history,
-    builder: (context, snap) {
-      final records = snap.data ?? const [];
-      if (records.isEmpty) return const SizedBox.shrink();
-      return MediaRow(
-        'Recently watched',
-        [for (final record in records) record.media],
-        autofocus: autofocus,
-        onBack: onReload,
-        subtitles: [
-          for (final r in records)
-            'EP ${epNumber(r.episode)}'
-                '${r.position > Duration.zero ? ' · ${formatDuration(r.position)}' : ''}',
-        ],
-        onLongPress: (i) => _removeFromHistory(context, records[i]),
-        onSeeAll: () async {
-          await pushSettled(
-            context,
-            MaterialPageRoute<void>(
-              builder: (_) => const RecentlyWatchedScreen(),
-            ),
+  Widget _continueWatching({bool autofocus = false}) =>
+      FutureBuilder<List<WatchRecord>>(
+        future: feed.history,
+        builder: (context, snap) {
+          final all = snap.data ?? const [];
+          final records = all.where(WatchHistory.isContinueWatching).toList();
+          if (records.isEmpty) return const SizedBox.shrink();
+          return _ContinueWatchingRow(
+            records: records,
+            autofocus: autofocus,
+            onReload: onReload,
+            onRemove: (record) => _removeFromHistory(context, record),
           );
-          onReload();
         },
       );
-    },
-  );
 
   Future<void> _removeFromHistory(
     BuildContext context,
@@ -1242,7 +1235,7 @@ class _HomeFeed extends StatelessWidget {
             DestructiveTile(
               autofocus: isTv,
               icon: Icons.history_toggle_off_rounded,
-              title: 'Remove from recently watched',
+              title: 'Remove from continue watching',
               onTap: () => Navigator.pop(context, true),
             ),
             const SizedBox(height: 8),
@@ -1301,6 +1294,202 @@ String _ago(int airingAt) {
     1 => 'yesterday',
     _ => '${days}d ago',
   };
+}
+
+class _ContinueWatchingRow extends StatelessWidget {
+  const _ContinueWatchingRow({
+    required this.records,
+    required this.autofocus,
+    required this.onReload,
+    required this.onRemove,
+  });
+
+  final List<WatchRecord> records;
+  final bool autofocus;
+  final VoidCallback onReload;
+  final ValueChanged<WatchRecord> onRemove;
+
+  @override
+  Widget build(BuildContext context) => ScrollAnchor(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SectionHeader(
+          'Continue watching',
+          action: isTv
+              ? null
+              : TextButton(
+                  onPressed: () async {
+                    await pushSettled(
+                      context,
+                      MaterialPageRoute<void>(
+                        builder: (_) => const RecentlyWatchedScreen(),
+                      ),
+                    );
+                    onReload();
+                  },
+                  child: const Text('See all'),
+                ),
+        ),
+        SizedBox(
+          height: MediaRow.height,
+          child: TvRow(
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              padding: EdgeInsets.symmetric(
+                horizontal: side,
+                vertical: isTv ? posterWidth * .075 : 0,
+              ),
+              itemCount: records.length,
+              separatorBuilder: (_, _) => SizedBox(width: gutter),
+              itemBuilder: (context, i) {
+                final record = records[i];
+                return FadeIn(
+                  index: i,
+                  child: _ContinueWatchingCard(
+                    record: record,
+                    autofocus: autofocus && i == 0,
+                    onTap: () async {
+                      await resumeWatching(context, record);
+                      onReload();
+                    },
+                    onLongPress: () => onRemove(record),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class _ContinueWatchingCard extends StatelessWidget {
+  const _ContinueWatchingCard({
+    required this.record,
+    required this.autofocus,
+    required this.onTap,
+    required this.onLongPress,
+  });
+
+  final WatchRecord record;
+  final bool autofocus;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final colorScheme = Theme.of(context).colorScheme;
+    final show = record.show;
+    final title = show.title;
+    final epText = 'EP ${epNumber(record.episode)}';
+    final dur = record.duration;
+    final pos = record.position;
+    final progress = (dur != null && dur > Duration.zero)
+        ? (pos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0)
+        : null;
+
+    final image = record.episodeThumbnail ?? show.cover;
+
+    return SizedBox(
+      width: posterWidth,
+      child: FocusCard(
+        autofocus: autofocus,
+        glow: hexColor(show.color),
+        semanticLabel: 'Resume $title $epText',
+        onTap: onTap,
+        onLongPress: onLongPress,
+        onFocus: () => focusedMedia.value = record.media,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AspectRatio(
+              aspectRatio: 2 / 3,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Artwork(image, color: show.color),
+                  const Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    height: 48,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [Colors.transparent, Colors.black87],
+                        ),
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    top: 8,
+                    left: 8,
+                    child: Pill(epText),
+                  ),
+                  Center(
+                    child: Container(
+                      decoration: const BoxDecoration(
+                        color: Colors.black54,
+                        shape: BoxShape.circle,
+                      ),
+                      padding: const EdgeInsets.all(8),
+                      child: const Icon(
+                        Icons.play_arrow_rounded,
+                        color: Colors.white,
+                        size: 28,
+                      ),
+                    ),
+                  ),
+                  if (progress != null)
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: ClipRRect(
+                        borderRadius: const BorderRadius.only(
+                          bottomLeft: Radius.circular(radiusSmall),
+                          bottomRight: Radius.circular(radiusSmall),
+                        ),
+                        child: LinearProgressIndicator(
+                          value: progress,
+                          minHeight: 4,
+                          backgroundColor: Colors.black54,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            colorScheme.primary,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: text.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              '$epText · ${formatDuration(pos)}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: text.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _OfflineBanner extends StatelessWidget {
