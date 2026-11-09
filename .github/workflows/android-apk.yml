@@ -2,6 +2,9 @@ name: Build Android Debug APK
 
 'on':
   workflow_dispatch:
+  push:
+    branches:
+      - master
 
 permissions:
   contents: read
@@ -24,7 +27,7 @@ jobs:
           cache: 'gradle'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Set up Flutter SDK
         uses: subosito/flutter-action@v2
@@ -48,5 +51,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: aniview-debug-apk
-          path: aniview-main/build/app/outputs/flutter-apk/*.apk
+          path: aniview-main/build/app/outputs/flutter-apk/app-debug.apk
           if-no-files-found: error
