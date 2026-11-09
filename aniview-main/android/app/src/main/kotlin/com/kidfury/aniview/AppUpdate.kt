@@ -13,8 +13,8 @@ import android.widget.Toast
 import java.io.File
 
 /**
- * Installs a downloaded update APK through a PackageInstaller session: Android shows its own "Update AniView?"
- * prompt straight away (no notification to find, which TVs barely show). From Android 12, once AniView installed
+ * Installs a downloaded update APK through a PackageInstaller session: Android shows its own "Update ANIZEN?"
+ * prompt straight away (no notification to find, which TVs barely show). From Android 12, once ANIZEN installed
  * itself this way, later updates need no prompt at all. Either way the app closes when it's replaced; the
  * notification posted afterwards opens it again.
  */

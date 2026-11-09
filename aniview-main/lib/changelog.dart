@@ -36,7 +36,7 @@ Future<void> showChangelog(BuildContext context) =>
 bool shouldShowWhatsNew({required String? seen, required String current}) =>
     seen != current;
 
-/// On the first launch of a version, the overview of what changed, with the two ways to support or join AniView pinned
+/// On the first launch of a version, the overview of what changed, with the two ways to support or join ANIZEN pinned
 /// under it. It's shown once: dismissing it (by any means) notes the version, and it doesn't come back.
 Future<void> maybeShowWhatsNew(BuildContext context) async {
   if (!shouldShowWhatsNew(

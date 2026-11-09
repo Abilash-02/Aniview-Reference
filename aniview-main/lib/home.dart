@@ -106,11 +106,6 @@ class _HomeScreenState extends State<HomeScreen>
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
       await checkForUpdate(context, quiet: true);
-      if (!mounted) return;
-      await maybeShowWhatsNew(context);
-      if (mounted && ModalRoute.of(context)?.isCurrent == true) {
-        await maybeShowSubscriptionSurvey(context);
-      }
     });
   }
 
@@ -388,6 +383,7 @@ class _HomeScreenState extends State<HomeScreen>
     width: 132,
     height: 44,
     fit: BoxFit.contain,
+    alignment: Alignment.centerLeft,
     semanticLabel: 'ANIZEN',
     cacheWidth: 440,
   );

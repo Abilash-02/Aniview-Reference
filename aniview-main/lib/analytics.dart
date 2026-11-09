@@ -51,7 +51,7 @@ class Analytics {
               // Rybbit reads the OS and device from the request's user agent.
               'User-Agent': _userAgent ??= await _agent().timeout(
                 const Duration(seconds: 2),
-                onTimeout: () => 'AniView',
+                onTimeout: () => 'ANIZEN',
               ),
             },
             body: jsonEncode({
@@ -79,9 +79,9 @@ class Analytics {
     try {
       final version = await AndroidApp.version();
       final device = await AndroidApp.device();
-      return 'AniView/$version (Linux; $device)';
+      return 'ANIZEN/$version (Linux; $device)';
     } catch (_) {
-      return 'AniView';
+      return 'ANIZEN';
     }
   }
 }

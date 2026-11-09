@@ -365,7 +365,7 @@ class Downloads extends ChangeNotifier {
     final root = await _chosenRoot(parent ?? '');
     if (parent != null && !await root.exists()) {
       throw FileSystemException(
-        'Select the parent of your existing AniView folder',
+        'Select the parent of your existing download folder',
         root.path,
       );
     }
@@ -411,7 +411,7 @@ class Downloads extends ChangeNotifier {
         throw 'Choose a folder outside the current download folder.';
       }
       if (await after.exists() && !await after.list().isEmpty) {
-        throw 'The destination AniView folder is not empty. Choose another folder.';
+        throw 'The destination download folder is not empty. Choose another folder.';
       }
       await after.parent.create(recursive: true);
       final stage = await after.parent.createTemp('.aniview-move-');

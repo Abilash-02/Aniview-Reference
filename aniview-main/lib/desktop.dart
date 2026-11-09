@@ -125,7 +125,7 @@ final navigatorKey = GlobalKey<NavigatorState>();
 
 String _pageTitle = '';
 
-/// The window's title follows where you are: "Shingeki no Kyojin · AniView".
+/// The window's title follows where you are: "Shingeki no Kyojin · ANIZEN".
 void setWindowTitle(String page) {
   _pageTitle = page;
   _showTitle(page);

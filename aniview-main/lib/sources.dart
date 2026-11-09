@@ -1200,8 +1200,8 @@ const _extensionSkips = {
 };
 
 /// A source from an installed Aniyomi extension, run through the [ExtensionHost].
-/// Extensions left out, offered and installed: the sites AniView reaches itself (see [topSources]), which would only duplicate them, Re:Anime, which
-/// AniView no longer offers, and torrent extensions, which need Aniyomi's torrent utilities.
+/// Extensions left out, offered and installed: the sites ANIZEN reaches itself (see [topSources]), which would only duplicate them, Re:Anime, which
+/// ANIZEN no longer offers, and torrent extensions, which need Aniyomi's torrent utilities.
 // ponytail: matched by package name; read a manifest flag if more torrent extensions appear
 const _hiddenExtensions = {
   'anikoto',

@@ -8,8 +8,8 @@ import 'ui.dart' show scheme, seed;
 /// Shown once per launch: set when the greeting has run, so a rebuilt app (a layout change) doesn't greet again.
 bool _greeted = false;
 
-/// The AniView wordmark drawing itself in, then "Welcome back, name", over [child] for a couple of seconds when the
-/// app opens, while [child] loads underneath. Off in Settings → Appearance.
+/// Clean, smooth ANIZEN startup animation over [child] when the app opens, while [child] loads underneath.
+/// Off in Settings → Appearance.
 class Welcome extends StatefulWidget {
   const Welcome({super.key, required this.child});
 
@@ -23,7 +23,7 @@ class _WelcomeState extends State<Welcome> with SingleTickerProviderStateMixin {
   final bool _showing = !_greeted && Settings.welcome;
   late final _run = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 2200),
+    duration: const Duration(milliseconds: 1500),
   );
 
   /// The last name the account answered with, so the greeting never waits on the network; refreshed for next time.
@@ -76,31 +76,31 @@ class _WelcomeState extends State<Welcome> with SingleTickerProviderStateMixin {
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
     final width = isTv
-        ? 520.0
-        : (MediaQuery.sizeOf(context).width * .7).clamp(200.0, 320.0);
-    final wordmark = Image.asset(
+        ? 480.0
+        : (MediaQuery.sizeOf(context).width * .65).clamp(180.0, 280.0);
+    final logo = Image.asset(
       scheme.brightness == Brightness.light
           ? 'assets/icon/aniview_wordmark_light.png'
           : 'assets/icon/aniview_wordmark.png',
       width: width,
+      fit: BoxFit.contain,
       semanticLabel: 'ANIZEN',
     );
-    final mark = _step(0, .27, Curves.easeOutBack);
-    final rest = _step(.27, .64, Curves.easeInOutCubic);
-    final pulse = _step(.16, .57, Curves.linear);
-    final greeting = _step(.61, .84);
-    final out = _step(.84, 1, Curves.easeIn);
-    // Always this Stack, so [child] keeps its place (and its state) when the greeting goes: swapping in the bare
-    // child would build the app's home again, and its first-launch work (What's new) with it.
+    final markFade = _step(0, .45, Curves.easeOut);
+    final markScale = _step(0, .55, Curves.easeOutCubic);
+    final glowFade = _step(.1, .6, Curves.easeInOut);
+    final greeting = _step(.45, .8);
+    final out = _step(.82, 1, Curves.easeIn);
+
+    // Always this Stack, so [child] keeps its place (and its state) when the greeting goes.
     return Stack(
       children: [
         // Settles from a touch larger as the splash fades, so the app arrives rather than being uncovered.
         ScaleTransition(
-          scale: Tween(begin: 1.03, end: 1.0).animate(out),
+          scale: Tween(begin: 1.02, end: 1.0).animate(out),
           child: widget.child,
         ),
-        // Lets go of taps and the remote as it fades, so nothing waits on it. Filling the screen: left to size
-        // itself it would only be as big as the glow.
+        // Lets go of taps and the remote as it fades, so nothing waits on it.
         if (_showing && !_done)
           Positioned.fill(
             child: IgnorePointer(
@@ -113,18 +113,18 @@ class _WelcomeState extends State<Welcome> with SingleTickerProviderStateMixin {
                     children: [
                       // The brand's cyan, softly behind the mark.
                       FadeTransition(
-                        opacity: _step(0, .4),
+                        opacity: glowFade,
                         child: Container(
-                          width: width * 1.8,
-                          height: width * 1.8,
+                          width: width * 1.6,
+                          height: width * 1.6,
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
                             gradient: RadialGradient(
                               colors: [
-                                seed.withValues(alpha: .16),
+                                seed.withValues(alpha: .18),
                                 seed.withValues(alpha: 0),
                               ],
-                              stops: const [0, .62],
+                              stops: const [0, .65],
                             ),
                           ),
                         ),
@@ -132,63 +132,23 @@ class _WelcomeState extends State<Welcome> with SingleTickerProviderStateMixin {
                       Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Stack(
-                            children: [
-                              // The "A" (the wordmark's first 29%) first…
-                              FadeTransition(
-                                opacity: mark,
-                                child: ScaleTransition(
-                                  scale: Tween(
-                                    begin: .92,
-                                    end: 1.0,
-                                  ).animate(mark),
-                                  alignment: const Alignment(-.7, .1),
-                                  child: _mask(wordmark, 0, .29, soft: 0),
-                                ),
-                              ),
-                              // …then "niView" wipes in after it.
-                              AnimatedBuilder(
-                                animation: rest,
-                                builder: (context, child) =>
-                                    _mask(child!, .29, .29 + .71 * rest.value),
-                                child: wordmark,
-                              ),
-                              // A glow passing over the play triangle in the "A".
-                              Positioned(
-                                left: width * .155 - width * .05,
-                                top: width / 3 * .52 - width * .05,
-                                child: AnimatedBuilder(
-                                  animation: pulse,
-                                  builder: (context, child) => Opacity(
-                                    opacity:
-                                        (1 - (pulse.value - .4).abs() / .6)
-                                            .clamp(0.0, 1.0) *
-                                        (pulse.value > 0 ? 1 : 0),
-                                    child: child,
-                                  ),
-                                  child: Container(
-                                    width: width * .1,
-                                    height: width * .1,
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      gradient: RadialGradient(
-                                        colors: [
-                                          seed.withValues(alpha: .85),
-                                          seed.withValues(alpha: 0),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
+                          // Clean, centered ANIZEN logo presentation with smooth scale and fade
+                          FadeTransition(
+                            opacity: markFade,
+                            child: ScaleTransition(
+                              scale: Tween(
+                                begin: .90,
+                                end: 1.0,
+                              ).animate(markScale),
+                              child: logo,
+                            ),
                           ),
-                          SizedBox(height: isTv ? 32 : 22),
+                          SizedBox(height: isTv ? 28 : 20),
                           FadeTransition(
                             opacity: greeting,
                             child: SlideTransition(
                               position: Tween(
-                                begin: const Offset(0, .3),
+                                begin: const Offset(0, .25),
                                 end: Offset.zero,
                               ).animate(greeting),
                               child: Text(
@@ -218,25 +178,4 @@ class _WelcomeState extends State<Welcome> with SingleTickerProviderStateMixin {
       ],
     );
   }
-
-  /// [child] shown only between [from] and [to] (fractions of its width), fading out over [soft] past [to].
-  static Widget _mask(
-    Widget child,
-    double from,
-    double to, {
-    double soft = .06,
-  }) => ShaderMask(
-    blendMode: BlendMode.dstIn,
-    shaderCallback: (bounds) => LinearGradient(
-      colors: const [
-        Colors.transparent,
-        Colors.transparent,
-        Colors.white,
-        Colors.white,
-        Colors.transparent,
-      ],
-      stops: [0, from, from, to, (to + soft).clamp(to, 1.0)],
-    ).createShader(bounds),
-    child: child,
-  );
 }

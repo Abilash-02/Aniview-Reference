@@ -18,7 +18,7 @@ import java.io.File
 
 /**
  * Turns a downloaded episode (a local HLS playlist, its segments maybe AES-128 encrypted) into one MP4, and copies
- * that into Movies/AniView so it shows up in the gallery.
+ * that into Movies/ANIZEN so it shows up in the gallery.
  */
 object GalleryExport {
     /**

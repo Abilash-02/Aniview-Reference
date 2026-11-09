@@ -487,7 +487,7 @@ class _PairingCode extends StatelessWidget {
 
 typedef FoundTv = ({String address, String name, String? id});
 
-/// TVs with AniView open on this network, as they answer a broadcast.
+/// TVs with ANIZEN open on this network, as they answer a broadcast.
 Stream<FoundTv> findTvs() {
   final found = StreamController<FoundTv>();
   () async {
@@ -573,7 +573,7 @@ Future<({String code, Uint8List key})?> _handshake(
   return null;
 }
 
-/// This phone as a remote for a TV running AniView: a D-pad, Back, playback keys and typing into the TV's
+/// This phone as a remote for a TV running ANIZEN: a D-pad, Back, playback keys and typing into the TV's
 /// text boxes. Pairs once per TV, which also signs the TV in when this phone is signed in, then finds it again
 /// by its id.
 class PhoneRemoteScreen extends StatefulWidget {

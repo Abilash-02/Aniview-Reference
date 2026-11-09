@@ -221,7 +221,7 @@ class Settings {
     }
   }
 
-  /// The original AniView theme remains the default for existing installs.
+  /// The original ANIZEN theme remains the default for existing installs.
   static ThemeSelection get themeSelection =>
       ThemeSelection.values.asNameMap()[_loaded
           ? _prefs.getString('theme_selection')
@@ -603,7 +603,11 @@ Map? updateAsset(
     'linux' => '${prefix}x86_64.AppImage',
     _ => null,
   };
-  return assets.cast<Map>().where((a) => a['name'] == name).firstOrNull;
+  final anizenName = name?.replaceFirst('AniView', 'ANIZEN');
+  return assets
+      .cast<Map>()
+      .where((a) => a['name'] == anizenName || a['name'] == name)
+      .firstOrNull;
 }
 
 /// The newest release for this build: a beta follows the betas (pre-releases, which install as their own app), the

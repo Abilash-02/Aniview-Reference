@@ -36,7 +36,7 @@ class Jellyfin extends Source {
   final Net net;
 
   static String _authorization([String? token]) =>
-      'MediaBrowser Client="AniView", Device="${Platform.operatingSystem}", '
+      'MediaBrowser Client="ANIZEN", Device="${Platform.operatingSystem}", '
       'DeviceId="${Settings.jellyfinDevice}", Version="1"${token == null ? '' : ', Token="$token"'}';
 
   static String _server(String address) {

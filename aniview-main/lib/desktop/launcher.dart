@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 import '../settings.dart' show appName, isBetaBuild;
 
 /// The app's id on Linux: its window class, and the name of its menu entry. The beta's is its own (see
-/// linux/CMakeLists.txt), so its entry sits beside AniView's.
+/// linux/CMakeLists.txt), so its entry sits beside ANIZEN's.
 const launcherId = isBetaBuild
     ? 'com.kidfury.aniview.beta'
     : 'com.kidfury.aniview';
@@ -20,11 +20,11 @@ File? get _entry => _home == null
     ? null
     : File('$_home/.local/share/applications/$launcherId.desktop');
 
-/// Whether AniView is in the app menu (a .desktop entry for it exists).
+/// Whether ANIZEN is in the app menu (a .desktop entry for it exists).
 Future<bool> launcherInstalled() async =>
     Platform.isLinux && (await _entry?.exists() ?? false);
 
-/// Puts AniView in the app menu, with its icon, and makes it the handler of `aniview://` links (which bring the browser's
+/// Puts ANIZEN in the app menu, with its icon, and makes it the handler of `aniview://` links (which bring the browser's
 /// sign-in back). Run again after moving the app, to point the entry at its new place. A package would install
 /// the same file.
 Future<void> installLauncher() async {
