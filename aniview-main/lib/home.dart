@@ -388,7 +388,7 @@ class _HomeScreenState extends State<HomeScreen>
     width: 132,
     height: 44,
     fit: BoxFit.contain,
-    semanticLabel: 'AniView',
+    semanticLabel: 'ANIZEN',
     cacheWidth: 440,
   );
 

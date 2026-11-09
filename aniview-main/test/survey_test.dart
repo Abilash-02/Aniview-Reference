@@ -18,7 +18,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 void main() {
   setUp(() async {
     PackageInfo.setMockInitialValues(
-      appName: 'AniView',
+      appName: 'ANIZEN',
       packageName: 'com.kidfury.aniview',
       version: 'test',
       buildNumber: '1',
@@ -153,7 +153,7 @@ void main() {
     addTearDown(() => isTv = false);
     Settings.analytics = false;
     PackageInfo.setMockInitialValues(
-      appName: 'AniView',
+      appName: 'ANIZEN',
       packageName: 'com.kidfury.aniview',
       version: '2.6.0',
       buildNumber: '36',

@@ -49,7 +49,7 @@ Future<void> showSubscriptionSurvey(BuildContext context) async {
       if (context.mounted) {
         showSuccess(
           context,
-          'Thanks for sharing your thoughts. Your feedback helps shape AniView’s future.',
+          'Thanks for sharing your thoughts. Your feedback helps shape ANIZEN’s future.',
         );
       }
     }

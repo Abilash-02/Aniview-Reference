@@ -83,7 +83,7 @@ class AppUpdateReceiver : BroadcastReceiver() {
         manager.notify(
             2026,
             builder.setSmallIcon(android.R.drawable.stat_sys_download_done)
-                .setContentTitle("AniView updated to $version")
+                .setContentTitle("ANIZEN updated to $version")
                 .setContentText("Tap to open")
                 .setContentIntent(open)
                 .setAutoCancel(true)

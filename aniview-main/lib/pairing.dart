@@ -339,7 +339,7 @@ class TvRemote {
       res = await post(tv, {'play': id});
     } catch (_) {
       connected.value = false;
-      throw Exception("Can't reach ${tv['name']}. Is AniView open on it?");
+      throw Exception("Can't reach ${tv['name']}. Is ANIZEN open on it?");
     }
     switch (res.statusCode) {
       case HttpStatus.ok:
@@ -347,9 +347,9 @@ class TvRemote {
       case HttpStatus.forbidden:
         throw Exception('The TV forgot this phone. Pair again');
       case HttpStatus.conflict:
-        throw Exception('Open AniView\'s home on the TV first');
+        throw Exception('Open ANIZEN\'s home on the TV first');
       default:
-        throw Exception('The TV couldn\'t play it. Update AniView there');
+        throw Exception('The TV couldn\'t play it. Update ANIZEN there');
     }
   }
 }
@@ -416,7 +416,7 @@ class _TvPairScreenState extends State<TvPairScreen> {
               ),
               const SizedBox(height: 8),
               Text(
-                'On your phone, on the same Wi-Fi, open AniView and go to\nSettings → TV → Set up AniView on a TV.'
+                'On your phone, on the same Wi-Fi, open ANIZEN and go to\nSettings → TV → Set up ANIZEN on a TV.'
                 '${signedIn ? '' : ' It becomes a remote and signs this TV in.'}',
                 textAlign: TextAlign.center,
                 style: TextStyle(color: scheme.onSurfaceVariant, height: 1.5),
@@ -719,13 +719,13 @@ class _PhoneRemoteScreenState extends State<PhoneRemoteScreen> {
           _forget();
           showError(context, 'The TV forgot this phone. Pair again');
         case HttpStatus.conflict:
-          showError(context, 'Open AniView\'s home on the TV to search');
+          showError(context, 'Open ANIZEN\'s home on the TV to search');
       }
     } catch (_) {
       if (!mounted || quiet) return;
       showError(
         context,
-        "Can't reach ${saved['name']}. Is AniView open on it?",
+        "Can't reach ${saved['name']}. Is ANIZEN open on it?",
       );
       if (!scanning) _scan();
     }
@@ -787,7 +787,7 @@ class _PhoneRemoteScreenState extends State<PhoneRemoteScreen> {
     ),
     children: [
       Text(
-        'On the TV, open AniView and choose Sign in, or Settings → Phone remote. Keep both on the same Wi-Fi.'
+        'On the TV, open ANIZEN and choose Sign in, or Settings → Phone remote. Keep both on the same Wi-Fi.'
         '${!Tracker.signedIn ? '' : ' Pairing also signs the TV in as you, if it isn\'t already.'}',
         style: TextStyle(color: scheme.onSurfaceVariant, height: 1.5),
       ),

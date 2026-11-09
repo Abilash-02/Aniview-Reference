@@ -81,7 +81,7 @@ class _SubscriptionSurveyDialogState extends State<SubscriptionSurveyDialog> {
     child: AlertDialog(
       scrollable: true,
       constraints: const BoxConstraints(maxWidth: 560),
-      title: const Text('Would you pay US\$1 per month to use AniView?'),
+      title: const Text('Would you pay US\$1 per month to use ANIZEN?'),
       content: SizedBox(
         width: 480,
         child: Column(

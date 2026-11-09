@@ -264,7 +264,7 @@ class _ExtensionsScreenState extends State<ExtensionsScreen> {
       builder: (context) => PanelDialog(
         title: Text('Install ${extension.name}?'),
         content: Text(
-          'Extensions run their own code inside AniView. Only install ones '
+          'Extensions run their own code inside ANIZEN. Only install ones '
           'from ${extension.repo.name} if you trust it.',
         ),
         actions: [
@@ -312,7 +312,7 @@ class _ExtensionsScreenState extends State<ExtensionsScreen> {
             title: 'No extension repos',
             message:
                 'Add an Aniyomi extension repo to watch from more sites. '
-                'AniView doesn\'t come with one.',
+                'ANIZEN doesn\'t come with one.',
             action: FilledButton.icon(
               autofocus: isTv,
               onPressed: _addRepo,

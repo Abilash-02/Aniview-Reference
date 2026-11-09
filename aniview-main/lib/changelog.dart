@@ -109,7 +109,7 @@ class _WhatsNew extends StatelessWidget {
         sheetTitle(
           context,
           'What’s new in $changelogVersion',
-          subtitle: 'The latest changes to AniView',
+          subtitle: 'The latest changes to ANIZEN',
         ),
         // The overview scrolls; the buttons under it stay put.
         Flexible(

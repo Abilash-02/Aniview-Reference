@@ -1,5 +1,5 @@
 name: aniview
-description: "AniView: watch and track anime with AniList or MyAnimeList."
+description: "ANIZEN: watch and track anime with AniList or MyAnimeList."
 publish_to: 'none'
 version: 2.6.1+37
 
@@ -42,3 +42,5 @@ flutter:
     - assets/icon/aniview_icon.png
     - assets/icon/aniview_wordmark.png
     - assets/icon/aniview_wordmark_light.png
+    - assets/images/anizen_launcher_icon.png
+    - assets/images/anizen_splash.png

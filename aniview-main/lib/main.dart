@@ -85,7 +85,7 @@ class _AppState extends State<App> with WidgetsBindingObserver {
 
   Widget _app(Key key) => MaterialApp(
     key: key,
-    title: 'AniView',
+    title: 'ANIZEN',
     navigatorKey: isDesktop ? navigatorKey : null,
     scrollBehavior: isDesktop ? const DesktopScroll() : null,
     debugShowCheckedModeBanner: false,

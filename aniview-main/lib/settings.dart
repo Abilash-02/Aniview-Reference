@@ -40,7 +40,7 @@ enum SkipMode { button, auto, off }
 /// A fixed set of visual themes; the saved enum names preserve earlier choices.
 enum ThemeSelection {
   custom(
-    'AniView Custom',
+    'ANIZEN Custom',
     'Original dark look',
     Color(0xFF01C4FA),
     Brightness.dark,
@@ -551,8 +551,8 @@ const _releases =
     'https://api.github.com/repos/ebrahimHakimuddin/aniview/releases';
 const isBetaBuild = bool.fromEnvironment('ANIVIEW_BETA');
 
-/// What this build is called: the beta installs beside AniView as an app of its own.
-const appName = isBetaBuild ? 'AniView Beta' : 'AniView';
+/// What this build is called: the beta installs beside ANIZEN as an app of its own.
+const appName = isBetaBuild ? 'ANIZEN Beta' : 'ANIZEN';
 
 /// Whether release tag [latest] ("v1.5.2", "v2.6.0-beta.2") is a newer version than [current] ("1.5.1"). A
 /// release is newer than its own betas, and betas go by their number.
@@ -706,7 +706,7 @@ Future<void> _install(BuildContext context, File file) async {
   switch (Platform.operatingSystem) {
     case 'android':
       if (!await AndroidApp.installApk(file.path) && context.mounted) {
-        showSuccess(context, 'Allow AniView to install apps, then come back');
+        showSuccess(context, 'Allow ANIZEN to install apps, then come back');
       }
     case 'windows':
       await Process.start(file.path, [
@@ -1284,7 +1284,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         SwitchListTile(
           title: const Text('Welcome screen'),
-          subtitle: const Text('Greets you by name when AniView opens'),
+          subtitle: const Text('Greets you by name when ANIZEN opens'),
           value: Settings.welcome,
           onChanged: (v) => setState(() => Settings.welcome = v),
         ),
@@ -1469,17 +1469,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               isTv
                   ? 'Phone remote'
                   : Settings.tvRemotes.isEmpty
-                  ? 'Set up AniView on a TV'
+                  ? 'Set up ANIZEN on a TV'
                   : 'TV remote',
             ),
             subtitle: Text(
               isTv
-                  ? 'Control AniView on this TV from your phone'
+                  ? 'Control ANIZEN on this TV from your phone'
                   : Settings.tvRemotes.isEmpty
                   ? isDesktop
-                        ? 'Pair a TV running AniView to sign it in from this computer and use it as the TV\'s remote'
-                        : 'Pair a TV running AniView to sign it in from this phone and use the phone as its remote'
-                  : 'Control AniView on ${Settings.tvRemotes.length == 1 ? Settings.tvRemotes.values.first['name'] : 'your TVs'}',
+                        ? 'Pair a TV running ANIZEN to sign it in from this computer and use it as the TV\'s remote'
+                        : 'Pair a TV running ANIZEN to sign it in from this phone and use the phone as its remote'
+                  : 'Control ANIZEN on ${Settings.tvRemotes.length == 1 ? Settings.tvRemotes.values.first['name'] : 'your TVs'}',
             ),
             onTap: () async {
               await pushSettled(
@@ -1804,7 +1804,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         if (Platform.isIOS)
           const ListTile(
             leading: Icon(Icons.folder_outlined),
-            title: Text('Downloads stay in AniView'),
+            title: Text('Downloads stay in ANIZEN'),
             subtitle: Text(
               'Keep the app open while downloading. Saved episodes are available offline.',
             ),
@@ -1864,7 +1864,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         if (Platform.isMacOS)
           const ListTile(
-            title: Text('Downloads stay in AniView'),
+            title: Text('Downloads stay in ANIZEN'),
             subtitle: Text(
               'Custom folders are unavailable until persistent sandbox access is supported.',
             ),
@@ -2002,7 +2002,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               title: Text(
                 snap.data == true
                     ? 'Update the app menu entry'
-                    : 'Add AniView to the app menu',
+                    : 'Add ANIZEN to the app menu',
               ),
               subtitle: const Text(
                 'A launcher with its icon, which also lets the browser return you here after signing in',
@@ -2010,7 +2010,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onTap: () async {
                 await installLauncher();
                 if (!mounted) return;
-                showSuccess(this.context, 'AniView is in your app menu');
+                showSuccess(this.context, 'ANIZEN is in your app menu');
                 setState(() {});
               },
             ),
@@ -2025,7 +2025,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         if (Analytics.available && Settings.analytics)
           ListTile(
             leading: const Icon(Icons.poll_outlined),
-            title: const Text('AniView’s future'),
+            title: const Text('ANIZEN’s future'),
             subtitle: Text(
               Settings.subscriptionSurveyState == 'answered'
                   ? 'Thanks for sharing your thoughts'

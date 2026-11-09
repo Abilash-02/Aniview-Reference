@@ -83,7 +83,7 @@ class _WelcomeState extends State<Welcome> with SingleTickerProviderStateMixin {
           ? 'assets/icon/aniview_wordmark_light.png'
           : 'assets/icon/aniview_wordmark.png',
       width: width,
-      semanticLabel: 'AniView',
+      semanticLabel: 'ANIZEN',
     );
     final mark = _step(0, .27, Curves.easeOutBack);
     final rest = _step(.27, .64, Curves.easeInOutCubic);

@@ -100,7 +100,7 @@ Future<SingleActivator?> recordShortcut(BuildContext context) {
           if (!keys.control && !keys.alt && !keys.meta) {
             setState(() => hint = 'Hold $shortcutKey or Alt too');
           } else if (key == LogicalKeyboardKey.keyQ) {
-            setState(() => hint = '${keysLabel(keys)} quits AniView');
+            setState(() => hint = '${keysLabel(keys)} quits ANIZEN');
           } else {
             Navigator.pop(dialog, keys);
           }
@@ -136,7 +136,7 @@ void setPlayerTitle(String? title) => _showTitle(title ?? _pageTitle);
 
 void _showTitle(String page) {
   if (!isDesktop) return;
-  windowManager.setTitle(page.isEmpty ? 'AniView' : '$page · AniView').ignore();
+  windowManager.setTitle(page.isEmpty ? 'ANIZEN' : '$page · ANIZEN').ignore();
 }
 
 /// The dropdown menu that's open, if any: Esc closes it before it goes back a page.
@@ -167,7 +167,7 @@ Future<void> setupWindow() async {
     WindowOptions(
       size: saved?.size ?? const Size(1100, 750),
       minimumSize: const Size(700, 560),
-      title: 'AniView',
+      title: 'ANIZEN',
     ),
     () async {
       if (saved != null && saved.left >= 0 && saved.top >= 0) {
